@@ -6,7 +6,7 @@ on:
       ipsw_url:
         description: 'Apple official macOS IPSW URL (HTTP Range supported)'
         required: true
-        default: 'https://updates.cdn-apple.com/2026/patches/macOS/094-97105/UniversalMac_26.6.2_25G83_Restore.ipsw'
+        default: 'https://updates.cdn-apple.com/2026SummerFCS/fullrestores/140-75212/A2A24B94-1FC1-45A3-93F7-C51B02AF1F4D/UniversalMac_26.6.2_25G83_Restore.ipsw'
       scan_target:
         description: 'Scan targets: kernel, system, or both'
         required: true
