@@ -2,13 +2,17 @@
 """
 High-Performance Apple Silicon AArch64 Compatibility Scanner
 ============================================================
-Scans Mach-O binaries for instructions and system registers incompatible
-with standard AArch64 cloud processors.
+Scans Mach-O binaries (including MH_FILESET kernelcaches) and Dyld Shared Caches
+for instructions and system registers incompatible with standard AArch64 processors.
 
-Optimizations:
-- O(1) Pre-filtering bitmasks: Filters 99.8% of normal ARM instructions in < 1 second.
-- O(1) CFG branch bounds tracking: Eliminates quadratic scan complexity.
-- Validates system registers against ARM DDI 0487 standard whitelist.
+Features:
+- O(1) Pre-filtering bitmasks (filters 99.8% of normal ARM instructions in seconds).
+- Strict CPU architecture validation (skips x86_64 legacy drivers).
+- Native support for Dyld Shared Caches (dyld_shared_cache_arm64e).
+- Resolves cache addresses to real dylib/framework paths.
+- Accurate MH_FILESET inner segment mapping.
+- Memory barrier and hint instruction filtering (dsb, dmb, isb, etc.).
+- ARM ARM DDI 0487 standard system register whitelist.
 """
 
 import os
@@ -16,8 +20,8 @@ import sys
 import struct
 import json
 import time
+import array
 import capstone
-from capstone import arm64
 
 ARM_STANDARD_SYSREGS = {
     "midr_el1", "mpidr_el1", "revidr_el1", "id_aa64pfr0_el1", "id_aa64pfr1_el1",
@@ -41,6 +45,12 @@ ARM_STANDARD_SYSREGS = {
     "pmxevtyper_el0", "pmxevcntr_el0", "pmuserenr_el0", "pmintenset_el1", "pmintenclr_el1"
 }
 
+IGNORED_MNEMONICS = {
+    'dsb', 'dmb', 'isb', 'clrex', 'nop', 'yield', 'wfe', 'wfi', 'sev', 'sevl',
+    'pacia', 'pacib', 'pacda', 'pacdb', 'autia', 'autib', 'autda', 'autdb',
+    'paciasp', 'pacibsp', 'autiasp', 'autibsp'
+}
+
 def decode_uleb128(data, offset):
     result, shift = 0, 0
     while offset < len(data):
@@ -50,13 +60,24 @@ def decode_uleb128(data, offset):
         shift += 7
     return result, offset
 
-def scan_macho_bytes(data, comp_name="standalone"):
-    if len(data) < 32: return []
-    magic = struct.unpack('<I', data[:4])[0]
+def parse_sysreg_operand(op_str):
+    ops = [op.strip().lower() for op in op_str.split(',')]
+    for op in ops:
+        if not op.startswith('x') and not op.startswith('w') and not op.isdigit() and op not in ['xzr', 'wzr']:
+            return op
+    return None
+
+def scan_macho_bytes(data, comp_name="standalone", header_off=0):
+    if len(data) < header_off + 32: return []
+    magic = struct.unpack('<I', data[header_off:header_off+4])[0]
     if magic != 0xfeedfacf: return []
 
-    ncmds = struct.unpack('<I', data[16:20])[0]
-    idx = 32
+    cputype = struct.unpack('<I', data[header_off+4:header_off+8])[0]
+    if cputype != 0x0100000c: # CPU_TYPE_ARM64
+        return []
+
+    ncmds = struct.unpack('<I', data[header_off+16:header_off+20])[0]
+    idx = header_off + 32
 
     seg0_vm = None
     fn_starts_off, fn_starts_sz = None, None
@@ -65,6 +86,7 @@ def scan_macho_bytes(data, comp_name="standalone"):
     syms = []
 
     for _ in range(ncmds):
+        if idx + 8 > len(data): break
         cmd, csz = struct.unpack('<II', data[idx:idx+8])
         cdata = data[idx+8:idx+csz]
         if cmd == 0x19: # LC_SEGMENT_64
@@ -171,9 +193,12 @@ def scan_macho_bytes(data, comp_name="standalone"):
                 dis = list(cs.disasm(chunk, pc))
                 if dis:
                     insn = dis[0]
-                    reg_name = insn.op_str.split(',')[-1].strip().lower()
-                    if reg_name.startswith('x') or reg_name.startswith('w'):
-                        reg_name = insn.op_str.split(',')[0].strip().lower()
+                    if insn.mnemonic in IGNORED_MNEMONICS:
+                        continue
+
+                    reg_name = parse_sysreg_operand(insn.op_str)
+                    if not reg_name:
+                        continue
 
                     if '_c15_' in reg_name:
                         issues.append({
@@ -206,42 +231,194 @@ def scan_macho_bytes(data, comp_name="standalone"):
 
     return issues
 
+def scan_dyld_cache_file(fpath):
+    print(f"[*] Parsing Dyld Shared Cache: {fpath}")
+    issues = []
+    try:
+        with open(fpath, 'rb') as f:
+            hdr = f.read(0x200)
+    except Exception as e:
+        print(f"    [-] Cannot read cache header: {e}")
+        return []
+
+    if len(hdr) < 0x24: return []
+    magic = hdr[:16].rstrip(b'\x00')
+    if not magic.startswith(b'dyld_v1'):
+        return []
+    if b'arm64' not in magic:
+        print(f"    [-] Skipping non-arm64 cache: {magic}")
+        return []
+
+    map_off, map_cnt = struct.unpack('<II', hdr[16:24])
+    try:
+        with open(fpath, 'rb') as f:
+            f.seek(map_off)
+            map_data = f.read(map_cnt * 32)
+    except Exception as e:
+        print(f"    [-] Failed to read mapping table: {e}")
+        return []
+
+    images = []
+    # Check for images table
+    img_off, img_cnt = 0, 0
+    if len(hdr) >= 0x170:
+        img_off, img_cnt = struct.unpack('<II', hdr[0x168:0x170])
+    if img_off == 0 and len(hdr) >= 0x20:
+        img_off, img_cnt = struct.unpack('<II', hdr[0x18:0x20])
+
+    if img_off > 0 and img_cnt > 0:
+        try:
+            with open(fpath, 'rb') as f:
+                f.seek(img_off)
+                img_data = f.read(min(img_cnt, 4000) * 32)
+                for idx in range(min(img_cnt, 4000)):
+                    addr, _, _, path_off, _ = struct.unpack('<QQQII', img_data[idx*32:(idx+1)*32])
+                    f.seek(path_off)
+                    path = f.read(256).split(b'\x00')[0].decode('ascii', errors='ignore')
+                    images.append((addr, path))
+            images.sort()
+        except: pass
+
+    def get_image_for_addr(va):
+        if not images: return os.path.basename(fpath)
+        cur = os.path.basename(fpath)
+        for iaddr, ipath in images:
+            if iaddr <= va: cur = ipath
+            else: break
+        return cur
+
+    cs = capstone.Cs(capstone.CS_ARCH_ARM64, capstone.CS_MODE_ARM)
+    cs.detail = True
+
+    try:
+        with open(fpath, 'rb') as f:
+            for m in range(map_cnt):
+                addr, sz, foff, max_prot, init_prot = struct.unpack('<QQQII', map_data[m*32:(m+1)*32])
+                # Only scan executable mappings (VM_PROT_EXECUTE = 4)
+                if (init_prot & 4) == 0:
+                    continue
+
+                print(f"    [+] Scanning executable mapping @ 0x{addr:x} ({sz // (1024*1024)} MB)...")
+                f.seek(foff)
+                CHUNK = 64 * 1024 * 1024
+                scanned = 0
+                while scanned < sz:
+                    to_read = min(CHUNK, sz - scanned)
+                    chunk = f.read(to_read)
+                    if not chunk: break
+
+                    arr = array.array('I')
+                    arr.frombytes(chunk)
+                    cur_va = addr + scanned
+
+                    for idx, w in enumerate(arr):
+                        is_sysreg = ((w >> 22) == 0x354)
+                        is_amx = ((w & 0xffe00000) == 0x00200000)
+
+                        if is_sysreg or is_amx:
+                            pc = cur_va + idx * 4
+                            raw_insn = chunk[idx*4:idx*4+4]
+                            dis = list(cs.disasm(raw_insn, pc))
+                            comp_name = get_image_for_addr(pc)
+
+                            if dis:
+                                insn = dis[0]
+                                if insn.mnemonic in IGNORED_MNEMONICS:
+                                    continue
+                                reg_name = parse_sysreg_operand(insn.op_str)
+                                if not reg_name: continue
+
+                                if '_c15_' in reg_name:
+                                    issues.append({
+                                        "component": comp_name,
+                                        "function": f"0x{pc:x}",
+                                        "fn_start": hex(pc),
+                                        "pc": hex(pc),
+                                        "type": "IMP_DEF_SYSREG",
+                                        "detail": f"{insn.mnemonic} {insn.op_str}"
+                                    })
+                                elif reg_name.startswith('s') and reg_name not in ARM_STANDARD_SYSREGS:
+                                    issues.append({
+                                        "component": comp_name,
+                                        "function": f"0x{pc:x}",
+                                        "fn_start": hex(pc),
+                                        "pc": hex(pc),
+                                        "type": "NON_STD_SYSREG",
+                                        "detail": f"{insn.mnemonic} {insn.op_str}"
+                                    })
+                            else:
+                                if is_amx and (w & 0xffff) in [0x1000, 0x1020, 0x1040, 0x1060, 0x1080, 0x10a0]:
+                                    issues.append({
+                                        "component": comp_name,
+                                        "function": f"0x{pc:x}",
+                                        "fn_start": hex(pc),
+                                        "pc": hex(pc),
+                                        "type": "CUSTOM_ISA_AMX",
+                                        "detail": f"Apple AMX Opcode 0x{w:08x}"
+                                    })
+
+                    scanned += to_read
+    except Exception as e:
+        print(f"    [-] Error scanning mappings: {e}")
+
+    return issues
+
 def scan_path(target_path):
     all_issues = []
     if os.path.isfile(target_path):
-        with open(target_path, 'rb') as f:
-            data = f.read()
-        magic = struct.unpack('<I', data[:4])[0] if len(data) >= 4 else 0
-        if magic == 0xfeedfacf:
-            filetype = struct.unpack('<I', data[12:16])[0]
-            if filetype == 0xc: # MH_FILESET
-                ncmds = struct.unpack('<I', data[16:20])[0]
-                idx = 32
-                for _ in range(ncmds):
-                    cmd, csz = struct.unpack('<II', data[idx:idx+8])
-                    cdata = data[idx+8:idx+csz]
-                    if cmd == 0x80000035:
-                        vmaddr, fileoff, entry_id_off, _ = struct.unpack('<QQII', cdata[:24])
-                        entry_id = cdata[entry_id_off - 8:].split(b'\x00')[0].decode('ascii', errors='ignore')
-                        # Scan entry
-                        issues = scan_macho_bytes(data[fileoff:], entry_id)
-                        if issues:
-                            print(f"    [{entry_id}]: {len(issues)} issues")
-                            all_issues.extend(issues)
-                    idx += csz
-            else:
-                issues = scan_macho_bytes(data, os.path.basename(target_path))
-                all_issues.extend(issues)
+        try:
+            with open(target_path, 'rb') as f:
+                hdr = f.read(16)
+        except: return []
+
+        if hdr.startswith(b'dyld_v1'):
+            return scan_dyld_cache_file(target_path)
+
+        if len(hdr) >= 8:
+            magic = struct.unpack('<I', hdr[:4])[0]
+            if magic == 0xfeedfacf: # MH_MAGIC_64
+                cputype = struct.unpack('<I', hdr[4:8])[0]
+                if cputype != 0x0100000c: # Skip x86_64 and other non-ARM64
+                    return []
+
+                with open(target_path, 'rb') as f:
+                    data = f.read()
+
+                filetype = struct.unpack('<I', data[12:16])[0]
+                if filetype == 0xc: # MH_FILESET
+                    ncmds = struct.unpack('<I', data[16:20])[0]
+                    idx = 32
+                    for _ in range(ncmds):
+                        cmd, csz = struct.unpack('<II', data[idx:idx+8])
+                        cdata = data[idx+8:idx+csz]
+                        if cmd == 0x80000035: # LC_FILESET_ENTRY
+                            vmaddr, fileoff, entry_id_off, _ = struct.unpack('<QQII', cdata[:24])
+                            entry_id = cdata[entry_id_off - 8:].split(b'\x00')[0].decode('ascii', errors='ignore')
+                            # Accurate fileset entry scan
+                            issues = scan_macho_bytes(data, entry_id, header_off=fileoff)
+                            if issues:
+                                print(f"    [{entry_id}]: {len(issues)} issues")
+                                all_issues.extend(issues)
+                        idx += csz
+                else:
+                    issues = scan_macho_bytes(data, os.path.basename(target_path), header_off=0)
+                    all_issues.extend(issues)
     elif os.path.isdir(target_path):
-        for root, _, files in os.walk(target_path):
+        for root, dirs, files in os.walk(target_path):
+            # Prune non-binary and heavy asset directories
+            dirs[:] = [d for d in dirs if d not in ['.git', 'Resources', '_CodeSignature', 'Headers', 'Modules']]
             for file in files:
                 fpath = os.path.join(root, file)
                 try:
                     with open(fpath, 'rb') as f:
-                        magic = f.read(4)
-                    if magic == b'\xcf\xfa\xed\xfe':
-                        print(f"[*] Scanning: {fpath}")
-                        all_issues.extend(scan_path(fpath))
+                        magic = f.read(16)
+                    if magic.startswith(b'\xcf\xfa\xed\xfe'):
+                        cputype = struct.unpack('<I', magic[4:8])[0]
+                        if cputype == 0x0100000c: # Strictly ARM64
+                            print(f"[*] Scanning ARM64 Mach-O: {fpath}")
+                            all_issues.extend(scan_path(fpath))
+                    elif magic.startswith(b'dyld_v1') and b'arm64' in magic:
+                        all_issues.extend(scan_dyld_cache_file(fpath))
                 except: pass
     return all_issues
 
@@ -275,7 +452,7 @@ def main():
         key = (r['component'], r['function'], r['fn_start'])
         funcs.setdefault(key, []).append(r)
 
-    print(f"\nUnique functions requiring LLVM IR Lifting & Stubbing: {len(funcs)}")
+    print(f"\nUnique functions/locations requiring LLVM IR Lifting & Stubbing: {len(funcs)}")
     print("-" * 80)
     for (comp, fn, fstart), items in sorted(funcs.items())[:30]:
         print(f"[{comp}] {fn} (Entry: {fstart}) -> {len(items)} issues")
@@ -285,6 +462,7 @@ def main():
             print(f"    ... and {len(items)-2} more issues")
 
     if json_out:
+        os.makedirs(os.path.dirname(os.path.abspath(json_out)), exist_ok=True)
         with open(json_out, 'w') as f:
             json.dump(results, f, indent=2)
         print(f"\n[+] Full JSON report saved to: {json_out}")

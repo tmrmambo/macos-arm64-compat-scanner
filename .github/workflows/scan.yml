@@ -67,6 +67,7 @@ jobs:
       - name: Create Workspace Directories
         run: |
           mkdir -p /tmp/work/kernel
+          mkdir -p /tmp/work/kernel/extracted
           mkdir -p /tmp/work/system_aea
           mkdir -p /tmp/work/system_dmg
           mkdir -p /tmp/work/mnt
@@ -93,14 +94,23 @@ jobs:
             mv "${KC_ALT}.decompressed" /tmp/work/kernel/kernelcache.vma2.dec
           fi
 
+          echo "Extracting standalone Mach-O kernel and KEXTs for pristine analysis..."
+          ipsw kernel extract /tmp/work/kernel/kernelcache.vma2.dec -o /tmp/work/kernel/extracted || true
+
       - name: Scan Kernel for Non-Standard Instructions
         if: ${{ inputs.scan_target == 'both' || inputs.scan_target == 'kernel' }}
         run: |
           echo ">>> Scanning vma2 Kernel (High-Performance)..."
-          python3 scan_incompatible.py /tmp/work/kernel/kernelcache.vma2.dec --json reports/kernel_incompatible.json | tee reports/kernel_report.txt
+          if [ -d "/tmp/work/kernel/extracted" ] && [ "$(ls -A /tmp/work/kernel/extracted 2>/dev/null)" ]; then
+            echo "Scanning extracted standalone kernel & driver Mach-O files..."
+            python3 -u scan_incompatible.py /tmp/work/kernel/extracted --json reports/kernel_incompatible.json | tee reports/kernel_report.txt
+          else
+            echo "Scanning fileset kernelcache directly..."
+            python3 -u scan_incompatible.py /tmp/work/kernel/kernelcache.vma2.dec --json reports/kernel_incompatible.json | tee reports/kernel_report.txt
+          fi
 
       # ------------------------------------------------------------------------
-      # Task B: User Space (SystemOS AEA & APFS Root)
+      # Task B: User Space (SystemOS AEA, Dyld Shared Caches & APFS Root)
       # ------------------------------------------------------------------------
       - name: Extract & Decrypt SystemOS AEA DMG
         if: ${{ inputs.scan_target == 'both' || inputs.scan_target == 'system' }}
@@ -132,12 +142,13 @@ jobs:
             sudo apfs-fuse -o allow_other "$DMG_FILE" /tmp/work/mnt
             ls -la /tmp/work/mnt
             
-            echo "Scanning Userland System Libraries & Binaries..."
-            if [ -d "/tmp/work/mnt/usr/lib" ]; then
-              python3 scan_incompatible.py /tmp/work/mnt/usr/lib --json reports/userland_incompatible.json | tee reports/userland_report.txt
-            else
-              python3 scan_incompatible.py /tmp/work/mnt --json reports/userland_incompatible.json | tee reports/userland_report.txt
+            MNT_ROOT="/tmp/work/mnt"
+            if [ -d "/tmp/work/mnt/root" ]; then
+              MNT_ROOT="/tmp/work/mnt/root"
             fi
+            
+            echo "Scanning Userland (Dyld Shared Caches & ARM64 Mach-O binaries in $MNT_ROOT)..."
+            python3 -u scan_incompatible.py "$MNT_ROOT" --json reports/userland_incompatible.json | tee reports/userland_report.txt
           else
             echo "No decrypted DMG found to mount."
           fi
