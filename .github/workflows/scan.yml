@@ -89,14 +89,15 @@ jobs:
           else
             echo "[-] vma2 kernelcache not found in remote search, looking for any kernelcache..."
             KC_ALT=$(find /tmp/work/kernel -name "kernelcache.*" | head -n 1)
-            ipsw kernel dec "$KC_ALT" || true
+            ipsw kernel dec "$KC_ALT"
+            mv "${KC_ALT}.decompressed" /tmp/work/kernel/kernelcache.vma2.dec
           fi
 
       - name: Scan Kernel for Non-Standard Instructions
         if: ${{ inputs.scan_target == 'both' || inputs.scan_target == 'kernel' }}
         run: |
-          echo ">>> Scanning vma2 Kernel..."
-          python3 scan_incompatible.py /tmp/work/kernel --json reports/kernel_incompatible.json | tee reports/kernel_report.txt
+          echo ">>> Scanning vma2 Kernel (High-Performance)..."
+          python3 scan_incompatible.py /tmp/work/kernel/kernelcache.vma2.dec --json reports/kernel_incompatible.json | tee reports/kernel_report.txt
 
       # ------------------------------------------------------------------------
       # Task B: User Space (SystemOS AEA & APFS Root)
@@ -132,7 +133,11 @@ jobs:
             ls -la /tmp/work/mnt
             
             echo "Scanning Userland System Libraries & Binaries..."
-            python3 scan_incompatible.py /tmp/work/mnt --json reports/userland_incompatible.json | tee reports/userland_report.txt
+            if [ -d "/tmp/work/mnt/usr/lib" ]; then
+              python3 scan_incompatible.py /tmp/work/mnt/usr/lib --json reports/userland_incompatible.json | tee reports/userland_report.txt
+            else
+              python3 scan_incompatible.py /tmp/work/mnt --json reports/userland_incompatible.json | tee reports/userland_report.txt
+            fi
           else
             echo "No decrypted DMG found to mount."
           fi
