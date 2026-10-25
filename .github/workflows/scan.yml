@@ -17,6 +17,9 @@ on:
           - kernel
           - system
 
+env:
+  IPSW_APFS_FUSE_PATH: /usr/local/bin/apfs-fuse
+
 jobs:
   scan-and-analyze:
     runs-on: ubuntu-latest
@@ -38,14 +41,23 @@ jobs:
           docker-images: true
           swap-storage: false
 
-      - name: Install System Dependencies & apfs-fuse
+      - name: Install System Dependencies & Build apfs-fuse
         run: |
           sudo apt-get update
-          sudo apt-get install -y apfs-fuse python3-pip curl jq
+          sudo apt-get install -y build-essential cmake git libfuse3-dev zlib1g-dev libbz2-dev libattr1-dev python3-pip curl jq
+          echo "Cloning and building apfs-fuse from source..."
+          git clone --recursive https://github.com/sgan81/apfs-fuse.git /tmp/apfs-fuse
+          cd /tmp/apfs-fuse
+          mkdir build && cd build
+          cmake ..
+          make -j$(nproc)
+          sudo cp apfs-* /usr/local/bin/
+          which apfs-fuse
+          apfs-fuse -h || true
 
       - name: Install ipsw CLI & Capstone
         run: |
-          pip3 install capstone
+          pip3 install capstone --break-system-packages || pip3 install capstone
           IPSW_VER=$(curl -s https://api.github.com/repos/blacktop/ipsw/releases/latest | jq -r .tag_name | sed 's/v//')
           echo "Installing ipsw v${IPSW_VER}..."
           curl -L -o ipsw.deb "https://github.com/blacktop/ipsw/releases/download/v${IPSW_VER}/ipsw_${IPSW_VER}_linux_x86_64.deb"
@@ -115,6 +127,7 @@ jobs:
           DMG_FILE=$(find /tmp/work/system_dmg -name "*.dmg" | head -n 1)
           if [ -n "$DMG_FILE" ]; then
             echo "Mounting APFS container: $DMG_FILE"
+            sudo mkdir -p /tmp/work/mnt
             sudo apfs-fuse -o allow_other "$DMG_FILE" /tmp/work/mnt
             ls -la /tmp/work/mnt
             
@@ -128,6 +141,7 @@ jobs:
       # Summary & Artifact Upload
       # ------------------------------------------------------------------------
       - name: Generate GitHub Actions Step Summary
+        if: always()
         run: |
           echo "## 📊 macOS AArch64 Cloud Compatibility Analysis Summary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -145,6 +159,7 @@ jobs:
           fi
 
       - name: Upload Analysis Reports & JSON Artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: macos-aarch64-compatibility-reports
