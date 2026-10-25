@@ -1,0 +1,151 @@
+name: Scan macOS AArch64 Compatibility
+
+on:
+  workflow_dispatch:
+    inputs:
+      ipsw_url:
+        description: 'Apple official macOS IPSW URL (HTTP Range supported)'
+        required: true
+        default: 'https://updates.cdn-apple.com/2026/patches/macOS/094-97105/UniversalMac_26.6.2_25G83_Restore.ipsw'
+      scan_target:
+        description: 'Scan targets: kernel, system, or both'
+        required: true
+        default: 'both'
+        type: choice
+        options:
+          - both
+          - kernel
+          - system
+
+jobs:
+  scan-and-analyze:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Free Disk Space on Ubuntu Runner
+        uses: jlumbroso/free-disk-space@main
+        with:
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: false
+
+      - name: Install System Dependencies & apfs-fuse
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y apfs-fuse python3-pip curl jq
+
+      - name: Install ipsw CLI & Capstone
+        run: |
+          pip3 install capstone
+          IPSW_VER=$(curl -s https://api.github.com/repos/blacktop/ipsw/releases/latest | jq -r .tag_name | sed 's/v//')
+          echo "Installing ipsw v${IPSW_VER}..."
+          curl -L -o ipsw.deb "https://github.com/blacktop/ipsw/releases/download/v${IPSW_VER}/ipsw_${IPSW_VER}_linux_x86_64.deb"
+          sudo dpkg -i ipsw.deb
+          ipsw version
+
+      - name: Create Workspace Directories
+        run: |
+          mkdir -p /tmp/work/kernel
+          mkdir -p /tmp/work/system_aea
+          mkdir -p /tmp/work/system_dmg
+          mkdir -p /tmp/work/mnt
+          mkdir -p reports
+
+      # ------------------------------------------------------------------------
+      # Task A: Kernel Space (vma2 Guest Kernel)
+      # ------------------------------------------------------------------------
+      - name: Extract & Decompress vma2 Kernelcache
+        if: ${{ inputs.scan_target == 'both' || inputs.scan_target == 'kernel' }}
+        run: |
+          echo ">>> [1/2] Fetching vma2 kernelcache remotely..."
+          ipsw extract --remote "${{ inputs.ipsw_url }}" -k --pattern '.*vma2.*' -o /tmp/work/kernel
+          
+          KC_FILE=$(find /tmp/work/kernel -name "kernelcache.release.vma2" | head -n 1)
+          if [ -n "$KC_FILE" ]; then
+            echo "Decompressing kernelcache: $KC_FILE"
+            ipsw kernel dec "$KC_FILE"
+            mv "${KC_FILE}.decompressed" /tmp/work/kernel/kernelcache.vma2.dec
+          else
+            echo "[-] vma2 kernelcache not found in remote search, looking for any kernelcache..."
+            KC_ALT=$(find /tmp/work/kernel -name "kernelcache.*" | head -n 1)
+            ipsw kernel dec "$KC_ALT" || true
+          fi
+
+      - name: Scan Kernel for Non-Standard Instructions
+        if: ${{ inputs.scan_target == 'both' || inputs.scan_target == 'kernel' }}
+        run: |
+          echo ">>> Scanning vma2 Kernel..."
+          python3 scan_incompatible.py /tmp/work/kernel --json reports/kernel_incompatible.json | tee reports/kernel_report.txt
+
+      # ------------------------------------------------------------------------
+      # Task B: User Space (SystemOS AEA & APFS Root)
+      # ------------------------------------------------------------------------
+      - name: Extract & Decrypt SystemOS AEA DMG
+        if: ${{ inputs.scan_target == 'both' || inputs.scan_target == 'system' }}
+        run: |
+          echo ">>> [2/2] Fetching SystemOS DMG remotely..."
+          ipsw extract --remote "${{ inputs.ipsw_url }}" --dmg sys -o /tmp/work/system_aea
+          
+          AEA_FILE=$(find /tmp/work/system_aea -name "*.dmg.aea" | head -n 1)
+          if [ -n "$AEA_FILE" ]; then
+            echo "Querying WKMS decryption key for $AEA_FILE..."
+            KEY_RAW=$(ipsw fw aea -k "$AEA_FILE")
+            KEY_VAL=$(echo "$KEY_RAW" | grep "base64:" | cut -d':' -f2)
+            echo "Decryption Key retrieved successfully: $KEY_VAL"
+            
+            echo "Decrypting AEA archive..."
+            ipsw fw aea "$AEA_FILE" -o /tmp/work/system_dmg --key-val "$KEY_VAL"
+          else
+            echo "SystemOS AEA not found; looking for unencrypted DMG..."
+            find /tmp/work/system_aea -name "*.dmg" -exec mv {} /tmp/work/system_dmg/ \;
+          fi
+
+      - name: Mount APFS & Scan Userland Components
+        if: ${{ inputs.scan_target == 'both' || inputs.scan_target == 'system' }}
+        run: |
+          DMG_FILE=$(find /tmp/work/system_dmg -name "*.dmg" | head -n 1)
+          if [ -n "$DMG_FILE" ]; then
+            echo "Mounting APFS container: $DMG_FILE"
+            sudo apfs-fuse -o allow_other "$DMG_FILE" /tmp/work/mnt
+            ls -la /tmp/work/mnt
+            
+            echo "Scanning Userland System Libraries & Binaries..."
+            python3 scan_incompatible.py /tmp/work/mnt --json reports/userland_incompatible.json | tee reports/userland_report.txt
+          else
+            echo "No decrypted DMG found to mount."
+          fi
+
+      # ------------------------------------------------------------------------
+      # Summary & Artifact Upload
+      # ------------------------------------------------------------------------
+      - name: Generate GitHub Actions Step Summary
+        run: |
+          echo "## 📊 macOS AArch64 Cloud Compatibility Analysis Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ -f reports/kernel_report.txt ]; then
+            echo "### 🐧 Kernel Space (vma2) Analysis" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            head -n 40 reports/kernel_report.txt >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
+          if [ -f reports/userland_report.txt ]; then
+            echo "### 📦 User Space Analysis" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            head -n 40 reports/userland_report.txt >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Upload Analysis Reports & JSON Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-aarch64-compatibility-reports
+          path: reports/
