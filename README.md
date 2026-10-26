@@ -50,6 +50,33 @@ This repository includes a turnkey GitHub Actions workflow (`.github/workflows/s
 ### Triggering via GitHub CLI (`gh`)
 
 ```bash
+# Run compatibility scanner
+gh workflow run scan.yml -f scan_target=both
+
+# Run minimal rootfs & boot disk cloud packager
+gh workflow run package_minimal_rootfs.yml -f build_disk_image=true
+```
+
+---
+
+## 📦 Cloud RootFS & Boot Disk Packaging Pipeline
+
+The workflow `.github/workflows/package_minimal_rootfs.yml` automates the extraction and packaging of the minimal macOS 15 root filesystem directly on GitHub Actions runners, offloading heavy APFS mounting and disk I/O:
+1. **Remote Range Fetching & WKMS Decryption**: Fetches `FileSystem` (Base OS) and `SystemOS` (Cryptex) DMGs directly from Apple CDN and decrypts with `ipsw fw aea`.
+2. **APFS Container Mounting**: Dual mounts both containers with `apfs-fuse`.
+3. **Minimal Bootable RootFS Extraction**:
+   - `/sbin/launchd` (PID 1)
+   - `/usr/lib/dyld` (Dynamic linker)
+   - `/bin/zsh`, `/bin/sh`
+   - `/System/Library/dyld/dyld_shared_cache_arm64e*` (All shared cache subcaches)
+   - Base configs: `/private/var/db/.AppleSetupDone`, `/private/etc/*`, standard symlinks.
+4. **Multi-Format Packaging**:
+   - `minimal_rootfs.tar.zst`: Compressed root filesystem archive.
+   - `macos_minimal_disk.qcow2`: GPT partitioned disk (ESP FAT32 + Apple APFS Container) ready for QEMU / KVM VirtIO-Block.
+   - `macos_minimal_disk.raw.zst`: Compressed raw GPT disk image.
+   - `kernelcache.vma2.dec` & `DeviceTree.vma2macosap.im4p`: ESP boot assets.
+
+```bash
 gh workflow run scan.yml -f ipsw_url="<APPLE_IPSW_URL>" -f scan_target="both"
 ```
 

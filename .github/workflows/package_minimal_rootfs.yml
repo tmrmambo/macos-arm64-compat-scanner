@@ -1,0 +1,265 @@
+name: Package Minimal macOS RootFS
+
+on:
+  workflow_dispatch:
+    inputs:
+      ipsw_url:
+        description: 'Apple official macOS IPSW URL'
+        required: true
+        default: 'https://updates.cdn-apple.com/2026SummerFCS/fullrestores/140-75212/A2A24B94-1FC1-45A3-93F7-C51B02AF1F4D/UniversalMac_26.6.2_25G83_Restore.ipsw'
+      build_disk_image:
+        description: 'Generate bootable partitioned GPT disk image (ESP + APFS container)'
+        required: true
+        type: boolean
+        default: true
+
+env:
+  IPSW_APFS_FUSE_PATH: /usr/local/bin/apfs-fuse
+
+jobs:
+  package-minimal-rootfs:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Free Disk Space on Ubuntu Runner
+        uses: jlumbroso/free-disk-space@main
+        with:
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: false
+
+      - name: Install System Dependencies & Build apfs-fuse
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake git libfuse3-dev zlib1g-dev \
+                                  libbz2-dev libattr1-dev python3-pip curl jq \
+                                  qemu-utils zstd dosfstools mtools gdisk
+          echo "Cloning and building apfs-fuse from source..."
+          git clone --recursive https://github.com/sgan81/apfs-fuse.git /tmp/apfs-fuse
+          cd /tmp/apfs-fuse
+          mkdir build && cd build
+          cmake ..
+          make -j$(nproc)
+          sudo cp apfs-* /usr/local/bin/
+          which apfs-fuse
+          apfs-fuse -h || true
+
+      - name: Install ipsw CLI
+        run: |
+          IPSW_VER=$(curl -s https://api.github.com/repos/blacktop/ipsw/releases/latest | jq -r .tag_name | sed 's/v//')
+          echo "Installing ipsw v${IPSW_VER}..."
+          curl -L -o ipsw.deb "https://github.com/blacktop/ipsw/releases/download/v${IPSW_VER}/ipsw_${IPSW_VER}_linux_x86_64.deb"
+          sudo dpkg -i ipsw.deb
+          ipsw version
+
+      - name: Create Workspace Directories
+        run: |
+          mkdir -p /tmp/work/system_aea
+          mkdir -p /tmp/work/system_dmg
+          mkdir -p /tmp/work/fs_aea
+          mkdir -p /tmp/work/fs_dmg
+          mkdir -p /tmp/work/mnt_sys
+          mkdir -p /tmp/work/mnt_fs
+          mkdir -p /tmp/work/kernel
+          mkdir -p /tmp/work/dtree
+          mkdir -p /tmp/work/esp_files/EFI/BOOT
+          mkdir -p /tmp/work/minimal_rootfs
+          mkdir -p artifacts
+          mkdir -p reports
+
+      # ------------------------------------------------------------------------
+      # Step A: Remote fetch & decrypt SystemOS DMG (Dyld Shared Caches)
+      # ------------------------------------------------------------------------
+      - name: Extract & Decrypt SystemOS DMG
+        run: |
+          echo ">>> Fetching SystemOS DMG (Cryptex) remotely..."
+          ipsw extract --remote "${{ inputs.ipsw_url }}" --dmg sys -o /tmp/work/system_aea
+          
+          SYS_AEA=$(find /tmp/work/system_aea -name "*.dmg.aea" | head -n 1)
+          if [ -n "$SYS_AEA" ]; then
+            echo "Querying WKMS decryption key for $SYS_AEA..."
+            KEY_RAW=$(ipsw fw aea -k "$SYS_AEA")
+            KEY_VAL=$(echo "$KEY_RAW" | grep "base64:" | cut -d':' -f2)
+            echo "Decryption Key retrieved: $KEY_VAL"
+            echo "Decrypting SystemOS AEA archive..."
+            ipsw fw aea "$SYS_AEA" -o /tmp/work/system_dmg --key-val "$KEY_VAL"
+            echo "Reclaiming disk space (removing AEA)..."
+            rm -f "$SYS_AEA"
+          else
+            find /tmp/work/system_aea -name "*.dmg" -exec mv {} /tmp/work/system_dmg/ \;
+          fi
+          df -h /
+
+      # ------------------------------------------------------------------------
+      # Step B: Remote fetch & decrypt FileSystem DMG (launchd, dyld, zsh, /etc)
+      # ------------------------------------------------------------------------
+      - name: Extract & Decrypt FileSystem DMG
+        run: |
+          echo ">>> Fetching FileSystem DMG (Root OS) remotely..."
+          ipsw extract --remote "${{ inputs.ipsw_url }}" --dmg fs -o /tmp/work/fs_aea
+          
+          FS_AEA=$(find /tmp/work/fs_aea -name "*.dmg.aea" | head -n 1)
+          if [ -n "$FS_AEA" ]; then
+            echo "Querying WKMS decryption key for $FS_AEA..."
+            KEY_RAW=$(ipsw fw aea -k "$FS_AEA")
+            KEY_VAL=$(echo "$KEY_RAW" | grep "base64:" | cut -d':' -f2)
+            echo "Decryption Key retrieved: $KEY_VAL"
+            echo "Decrypting FileSystem AEA archive..."
+            ipsw fw aea "$FS_AEA" -o /tmp/work/fs_dmg --key-val "$KEY_VAL"
+            echo "Reclaiming disk space (removing AEA)..."
+            rm -f "$FS_AEA"
+          else
+            find /tmp/work/fs_aea -name "*.dmg" -exec mv {} /tmp/work/fs_dmg/ \;
+          fi
+          df -h /
+
+      # ------------------------------------------------------------------------
+      # Step C: Extract vma2 Kernelcache & DeviceTree for ESP Partition
+      # ------------------------------------------------------------------------
+      - name: Extract Boot Assets (Kernelcache & DeviceTree)
+        run: |
+          echo ">>> Fetching vma2 kernelcache remotely..."
+          ipsw extract --remote "${{ inputs.ipsw_url }}" -k --pattern '.*vma2.*' -o /tmp/work/kernel || true
+          KC_FILE=$(find /tmp/work/kernel -name "kernelcache.release.vma2" | head -n 1)
+          if [ -n "$KC_FILE" ]; then
+            echo "Decompressing kernelcache: $KC_FILE"
+            ipsw kernel dec "$KC_FILE"
+            cp "${KC_FILE}.decompressed" /tmp/work/esp_files/kernelcache.vma2.dec
+            cp "${KC_FILE}.decompressed" artifacts/kernelcache.vma2.dec
+          fi
+
+          echo ">>> Fetching DeviceTree remotely..."
+          ipsw extract --remote "${{ inputs.ipsw_url }}" --dtree -o /tmp/work/dtree || true
+          DTREE_FILE=$(find /tmp/work/dtree -name "*vma2*" | head -n 1)
+          if [ -n "$DTREE_FILE" ]; then
+            cp "$DTREE_FILE" /tmp/work/esp_files/DeviceTree.vma2macosap.im4p
+            cp "$DTREE_FILE" artifacts/DeviceTree.vma2macosap.im4p
+          fi
+
+      # ------------------------------------------------------------------------
+      # Step D: Mount APFS Containers & Assemble Minimal RootFS
+      # ------------------------------------------------------------------------
+      - name: Mount APFS Containers & Assemble Minimal RootFS
+        run: |
+          SYS_DMG=$(find /tmp/work/system_dmg -name "*.dmg" | head -n 1)
+          FS_DMG=$(find /tmp/work/fs_dmg -name "*.dmg" | head -n 1)
+
+          echo "SystemOS DMG: $SYS_DMG"
+          echo "FileSystem DMG: $FS_DMG"
+
+          if [ -n "$SYS_DMG" ]; then
+            echo "Mounting SystemOS APFS Container..."
+            sudo apfs-fuse -o allow_other "$SYS_DMG" /tmp/work/mnt_sys
+            ls -la /tmp/work/mnt_sys
+          fi
+
+          if [ -n "$FS_DMG" ]; then
+            echo "Mounting FileSystem APFS Container..."
+            sudo apfs-fuse -o allow_other "$FS_DMG" /tmp/work/mnt_fs
+            ls -la /tmp/work/mnt_fs
+          fi
+
+          echo "Assembling Minimal Bootable RootFS hierarchy..."
+          sudo python3 package_rootfs.py \
+            --fs-mount /tmp/work/mnt_fs \
+            --sys-mount /tmp/work/mnt_sys \
+            --output-dir /tmp/work/minimal_rootfs \
+            --manifest reports/rootfs_manifest.json \
+            --report reports/rootfs_report.txt
+
+          echo "Validating RootFS directory layout:"
+          sudo ls -la /tmp/work/minimal_rootfs/sbin
+          sudo ls -la /tmp/work/minimal_rootfs/usr/lib
+          sudo ls -la /tmp/work/minimal_rootfs/bin
+          sudo ls -la /tmp/work/minimal_rootfs/private/var/db
+
+      # ------------------------------------------------------------------------
+      # Step E: Compress Minimal RootFS into Tar.Zst
+      # ------------------------------------------------------------------------
+      - name: Package minimal_rootfs.tar.zst
+        run: |
+          echo ">>> Compressing Minimal RootFS hierarchy into minimal_rootfs.tar.zst..."
+          sudo tar -C /tmp/work/minimal_rootfs -cf - . | zstd -T0 -5 -o artifacts/minimal_rootfs.tar.zst
+          ls -lh artifacts/minimal_rootfs.tar.zst
+
+      # ------------------------------------------------------------------------
+      # Step F: Generate Partitioned GPT Disk Image (ESP + APFS Container)
+      # ------------------------------------------------------------------------
+      - name: Generate GPT Boot Disk Image (ESP + APFS)
+        if: ${{ inputs.build_disk_image }}
+        run: |
+          FS_DMG=$(find /tmp/work/fs_dmg -name "*.dmg" | head -n 1)
+          SYS_DMG=$(find /tmp/work/system_dmg -name "*.dmg" | head -n 1)
+          
+          # Choose FileSystem DMG as root container, fallback to SystemOS DMG
+          TARGET_DMG="$FS_DMG"
+          if [ -z "$TARGET_DMG" ]; then
+            TARGET_DMG="$SYS_DMG"
+          fi
+
+          chmod +x create_disk_image.sh
+          ./create_disk_image.sh "$TARGET_DMG" /tmp/work/esp_files artifacts/macos_minimal_disk.raw artifacts/macos_minimal_disk.qcow2
+          
+          df -h /
+
+      # ------------------------------------------------------------------------
+      # Step G: Step Summary & Artifact Upload
+      # ------------------------------------------------------------------------
+      - name: Generate GitHub Actions Step Summary
+        if: always()
+        run: |
+          echo "## 🚀 macOS 15 (vma2) Minimal RootFS Cloud Packaging Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ -f reports/rootfs_report.txt ]; then
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            cat reports/rootfs_report.txt >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📦 Generated Packaging Artifacts" >> $GITHUB_STEP_SUMMARY
+          echo "| Artifact Name | Size | Description |" >> $GITHUB_STEP_SUMMARY
+          echo "| :--- | :--- | :--- |" >> $GITHUB_STEP_SUMMARY
+          if [ -f artifacts/minimal_rootfs.tar.zst ]; then
+            SZ=$(ls -lh artifacts/minimal_rootfs.tar.zst | awk '{print $5}')
+            echo "| \`minimal_rootfs.tar.zst\` | $SZ | Complete minimal bootable rootfs (launchd, dyld, caches, zsh, /etc) |" >> $GITHUB_STEP_SUMMARY
+          fi
+          if [ -f artifacts/macos_minimal_disk.qcow2 ]; then
+            SZ=$(ls -lh artifacts/macos_minimal_disk.qcow2 | awk '{print $5}')
+            echo "| \`macos_minimal_disk.qcow2\` | $SZ | Partitioned GPT disk (ESP FAT32 + APFS Container) VirtIO-Block ready |" >> $GITHUB_STEP_SUMMARY
+          fi
+          if [ -f artifacts/macos_minimal_disk.raw.zst ]; then
+            SZ=$(ls -lh artifacts/macos_minimal_disk.raw.zst | awk '{print $5}')
+            echo "| \`macos_minimal_disk.raw.zst\` | $SZ | Compressed raw GPT disk image |" >> $GITHUB_STEP_SUMMARY
+          fi
+          if [ -f artifacts/kernelcache.vma2.dec ]; then
+            SZ=$(ls -lh artifacts/kernelcache.vma2.dec | awk '{print $5}')
+            echo "| \`kernelcache.vma2.dec\` | $SZ | Decompressed vma2 Mach-O fileset kernelcache |" >> $GITHUB_STEP_SUMMARY
+          fi
+          if [ -f artifacts/DeviceTree.vma2macosap.im4p ]; then
+            SZ=$(ls -lh artifacts/DeviceTree.vma2macosap.im4p | awk '{print $5}')
+            echo "| \`DeviceTree.vma2macosap.im4p\` | $SZ | vma2 Apple Silicon DeviceTree |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Fix Artifact Permissions for Upload
+        if: always()
+        run: |
+          sudo chown -R $USER:$USER artifacts reports 2>/dev/null || true
+
+      - name: Upload Packaging Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-15-vma2-minimal-rootfs
+          path: |
+            artifacts/*
+            reports/*
+          retention-days: 14

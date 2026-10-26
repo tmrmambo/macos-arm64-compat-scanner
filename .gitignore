@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*$py.class
+downloaded_reports/
+downloaded_reports_run2/
+*.raw
+*.qcow2
+*.tar.zst
+*.img
+*.dmg
+*.aea
+reports/
+*.log
