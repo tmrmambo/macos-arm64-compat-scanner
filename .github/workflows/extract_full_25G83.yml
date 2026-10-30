@@ -208,16 +208,27 @@ jobs:
           echo "APFS_FUSE_SHA=$APFS_FUSE_SHA" >> "$GITHUB_ENV"
           echo "apfs-fuse commit: $APFS_FUSE_SHA"
           cmake --version | head -n 1
-          # The runner image moved to CMake 4.x, which dropped compatibility
-          # with cmake_minimum_required(VERSION < 3.5). apfs-fuse still declares
-          # an old minimum, so configuring fails outright:
-          #   "Compatibility with CMake < 3.5 has been removed from CMake."
-          # This is the escape hatch CMake's own error message points at. Run
-          # 41037554980 died here, and the same breakage applies to scan.yml and
-          # package_minimal_rootfs.yml, which have not been touched.
+          g++ --version | head -n 1
+          # Two pieces of toolchain drift, both new since the last successful
+          # run (40319004513, 2026-10-26), and both of which break scan.yml and
+          # package_minimal_rootfs.yml identically. Those two are not touched.
+          #
+          # 1. CMAKE_POLICY_VERSION_MINIMUM: the image moved to CMake 4.x, which
+          #    removed support for the old cmake_minimum_required apfs-fuse
+          #    declares. Configure died with "Compatibility with CMake < 3.5 has
+          #    been removed from CMake." (run 41037554980). This flag is the
+          #    escape hatch CMake's own error message names.
+          #
+          # 2. -include cstdint: the image's g++ no longer pulls <cstdint> in
+          #    transitively, and ApfsLib/PList.h uses uint8_t/uint32_t without
+          #    including it, so PList.cpp failed with "uint8_t does not name a
+          #    type" (run 41038815362). Force-including the header fixes every
+          #    C++ translation unit at once and needs no patch to upstream.
+          #    C sources (3rdparty/lzfse) are left alone: cstdint is C++ only.
           cmake -S /tmp/apfs-fuse -B /tmp/apfs-fuse/build \
                 -DCMAKE_BUILD_TYPE=Release \
-                -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+                -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+                -DCMAKE_CXX_FLAGS='-include cstdint'
           cmake --build /tmp/apfs-fuse/build -j "$(nproc)"
           # package_minimal_rootfs.yml copies apfs-* only, which silently drops
           # apfsutil. We need it to log the container's volume list.
