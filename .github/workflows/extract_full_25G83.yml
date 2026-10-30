@@ -80,6 +80,10 @@ on:
         description: 'Pinned blacktop/ipsw release, no leading v. "latest" floats and is discouraged.'
         required: true
         default: '3.1.739'
+      apfs_fuse_ref:
+        description: 'sgan81/apfs-fuse commit or tag. Pinned so the build is reproducible; "main" floats.'
+        required: true
+        default: '66b86bd525e8cb90f9012543be89b1f092b75cf3'
       zstd_level:
         description: 'zstd level 1-19. Download bandwidth from GitHub is the bottleneck, not the local link, so a high ratio wins.'
         required: true
@@ -121,6 +125,7 @@ jobs:
       # crafted value cannot break out of the quoting.
       IPSW_URL: ${{ inputs.ipsw_url }}
       IPSW_VERSION: ${{ inputs.ipsw_version }}
+      APFS_FUSE_REF: ${{ inputs.apfs_fuse_ref }}
       ZSTD_LEVEL: ${{ inputs.zstd_level }}
       ZSTD_EXTRA: ${{ inputs.zstd_extra }}
       VERIFY: ${{ inputs.verify_archives && '1' || '0' }}
@@ -188,11 +193,31 @@ jobs:
       - name: Build apfs-fuse and record its commit
         run: |
           set -euo pipefail
+          if ! printf '%s' "$APFS_FUSE_REF" | grep -qE '^[A-Za-z0-9._/-]+$'; then
+            echo "::error title=Bad apfs_fuse_ref::unexpected characters"; exit 1
+          fi
           git clone --recursive https://github.com/sgan81/apfs-fuse.git /tmp/apfs-fuse
+          if [ "$APFS_FUSE_REF" != "main" ]; then
+            # F5 wanted the commit recorded; pinning it outright is strictly
+            # better, and now that one is known to build there is a value to pin.
+            git -C /tmp/apfs-fuse checkout --quiet --recurse-submodules "$APFS_FUSE_REF"
+          else
+            echo "::warning title=Unpinned apfs-fuse::following main; the build is not reproducible"
+          fi
           APFS_FUSE_SHA=$(git -C /tmp/apfs-fuse rev-parse HEAD)
           echo "APFS_FUSE_SHA=$APFS_FUSE_SHA" >> "$GITHUB_ENV"
           echo "apfs-fuse commit: $APFS_FUSE_SHA"
-          cmake -S /tmp/apfs-fuse -B /tmp/apfs-fuse/build -DCMAKE_BUILD_TYPE=Release
+          cmake --version | head -n 1
+          # The runner image moved to CMake 4.x, which dropped compatibility
+          # with cmake_minimum_required(VERSION < 3.5). apfs-fuse still declares
+          # an old minimum, so configuring fails outright:
+          #   "Compatibility with CMake < 3.5 has been removed from CMake."
+          # This is the escape hatch CMake's own error message points at. Run
+          # 41037554980 died here, and the same breakage applies to scan.yml and
+          # package_minimal_rootfs.yml, which have not been touched.
+          cmake -S /tmp/apfs-fuse -B /tmp/apfs-fuse/build \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_POLICY_VERSION_MINIMUM=3.5
           cmake --build /tmp/apfs-fuse/build -j "$(nproc)"
           # package_minimal_rootfs.yml copies apfs-* only, which silently drops
           # apfsutil. We need it to log the container's volume list.
