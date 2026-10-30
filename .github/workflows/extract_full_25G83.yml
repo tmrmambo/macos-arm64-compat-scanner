@@ -1,0 +1,698 @@
+name: Extract Full 25G83 (vma2)
+
+# =============================================================================
+# FULL file-level extraction of macOS 26.6.2 (25G83) for VirtualMac2,1 / vma2.
+#
+# Why this exists: the Windows workstation driving this project has no APFS
+# implementation, and the IPSW's rootfs/cryptex ".dmg" files are bare APFS
+# containers, not UDIF DMGs (docs/ipsw-extraction.md 1.2 / 6.2). So a Linux
+# runner with apfs-fuse is the only place these can be read at all. This
+# workflow does the one thing the local machine cannot: mount every APFS
+# container and tar it whole.
+#
+# Relationship to the other three workflows (none of which are modified):
+#   scan.yml                   static scanner, mounts SystemOS only, no export
+#   package_minimal_rootfs.yml copies 19 hand-picked files, builds a 12.5 GB
+#                              non-bootable disk image, one 22.37 GB artifact
+#   package_bootkit_v2.yml     the audit's fixes, but still a MINIMAL rootfs
+#   extract_full_25G83.yml     <- this one: FULL tars, no disk image, one
+#                              artifact per object so each can be downloaded
+#                              and verified independently
+#
+# -----------------------------------------------------------------------------
+# DISK BUDGET
+# -----------------------------------------------------------------------------
+# Measured facts, not the published spec: `ubuntu-latest` root is 145 GB with
+# roughly 86 GB free at job start (59 GB used). The documented "14 GB SSD" does
+# not match the image. See docs/cloud-extraction.md 2.1 for the raw df output.
+#
+# Containers are processed STRICTLY ONE AT A TIME:
+#   fetch .aea -> decrypt -> rm .aea -> mount -> tar+zstd -> upload -> rm tar
+#   -> umount -> rm container -> next
+# Two decrypted containers are never on disk together, and every phase ends
+# with `df -h /`.
+#
+#   phase                              on disk (GiB)   running total (GiB)
+#   toolchain + apfs-fuse + ipsw            1.5               1.5
+#   bootkit (kc, dtree, tc, rh, ticket)     0.1               1.6
+#   mtree                                   0.07              1.7
+#   rootfs  094-96884-092.dmg.aea           9.63             11.3
+#   rootfs  decrypted container            12.24             23.5   <-- PEAK
+#   rootfs  .aea deleted                  -9.63             13.9
+#   rootfs  tar.zst (est. <= 6)             6.0              19.9
+#   rootfs  uploaded, tar + container rm  -18.2               1.7
+#   sys     094-97105-093.dmg.aea           5.75              7.5
+#   sys     decrypted container             6.63             14.1
+#   sys     .aea deleted                  -5.75              8.3
+#   sys     tar.zst (est. <= 3)             3.0              11.3
+#   sys     uploaded, cleaned             -9.63               1.7
+#   app     094-96883-093.dmg (50 MiB)      0.1               1.8
+#   optional BaseSystem / RamDisk          <6.0              <7.7
+#
+# PEAK = 23.5 GiB of payload on top of the 59 GB already used, i.e. about
+# 25 GB decimal against 86 GB free, leaving ~61 GB headroom (3.4x). Safe
+# without running any disk-reclaim step, which is why the third-party
+# free-disk-space action is gone (F5) and reclaim is an opt-in inline step.
+#
+# -----------------------------------------------------------------------------
+# AUDIT ITEMS THIS WORKFLOW CLOSES (docs/cloud-extraction.md)
+# -----------------------------------------------------------------------------
+#   F1  mount trees and /etc probes are always dumped; nothing is synthesised,
+#       so there is no fallback left that could report SUCCESS over a gap
+#   F3  no raw/qcow2 disk image at all; this is file-level data only
+#   F4  TrustCache, root_hash, apticket and mtree ship in their own artifacts
+#   F5  ipsw pinned, apfs-fuse commit recorded, no branch-ref third-party action
+#   F6  the AEA key is masked before anything is printed and an empty key is a
+#       hard failure (see aea_decrypt.sh); the key from run 40319004513 leaked
+#       into a public log and must never happen again
+#   every degraded branch appends to reports/missing_components.txt, which the
+#   Step Summary prints whether the job passed or failed
+# =============================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      ipsw_url:
+        description: 'Apple IPSW URL (must support HTTP Range). Default is the verified 25G83 CDN link.'
+        required: true
+        default: 'https://updates.cdn-apple.com/2026SummerFCS/fullrestores/140-75212/A2A24B94-1FC1-45A3-93F7-C51B02AF1F4D/UniversalMac_26.6.2_25G83_Restore.ipsw'
+      ipsw_version:
+        description: 'Pinned blacktop/ipsw release, no leading v. "latest" floats and is discouraged.'
+        required: true
+        default: '3.1.739'
+      zstd_level:
+        description: 'zstd level 1-19. Download bandwidth from GitHub is the bottleneck, not the local link, so a high ratio wins.'
+        required: true
+        default: '12'
+      zstd_extra:
+        description: 'Extra zstd flags. --long=27 helps the shared cache and still decompresses with a default 128 MiB window.'
+        required: true
+        default: '--long=27'
+      verify_archives:
+        description: 'Read every tar.zst back: proves it decompresses, counts members, saves the member list.'
+        required: true
+        type: boolean
+        default: true
+      include_basesystem:
+        description: 'Also tar BaseSystem (022-22048-093.dmg.aea, 1.06 GiB). Separate artifact, off the main path.'
+        required: true
+        type: boolean
+        default: false
+      include_ramdisk:
+        description: 'Also tar RestoreRamDisk (094-96989-093.dmg, 202 MiB). Separate artifact.'
+        required: true
+        type: boolean
+        default: false
+      reclaim_disk:
+        description: 'Inline disk reclaim before starting. Not needed at the measured 86 GB free; kept as an escape hatch.'
+        required: true
+        type: boolean
+        default: false
+
+jobs:
+  extract-full:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    permissions:
+      contents: read
+
+    env:
+      # Inputs go through env, never interpolated into a shell line, so a
+      # crafted value cannot break out of the quoting.
+      IPSW_URL: ${{ inputs.ipsw_url }}
+      IPSW_VERSION: ${{ inputs.ipsw_version }}
+      ZSTD_LEVEL: ${{ inputs.zstd_level }}
+      ZSTD_EXTRA: ${{ inputs.zstd_extra }}
+      VERIFY: ${{ inputs.verify_archives && '1' || '0' }}
+      WORK: /tmp/work
+      REPORTS: reports
+      MISSING_FILE: reports/missing_components.txt
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate inputs
+        run: |
+          set -euo pipefail
+          case "$IPSW_URL" in
+            https://*) ;;
+            *) echo "::error title=Bad ipsw_url::must be an https URL"; exit 1 ;;
+          esac
+          if ! printf '%s' "$IPSW_VERSION" | grep -qE '^([0-9]+\.[0-9]+\.[0-9]+|latest)$'; then
+            echo "::error title=Bad ipsw_version::expected N.N.N or latest"; exit 1
+          fi
+          if ! printf '%s' "$ZSTD_LEVEL" | grep -qE '^([1-9]|1[0-9])$'; then
+            echo "::error title=Bad zstd_level::expected 1-19"; exit 1
+          fi
+          # zstd_extra is spliced into a command line, so restrict it hard.
+          if ! printf '%s' "$ZSTD_EXTRA" | grep -qE '^[-A-Za-z0-9=. ]*$'; then
+            echo "::error title=Bad zstd_extra::only [-A-Za-z0-9=. ] allowed"; exit 1
+          fi
+          echo "url host  : $(printf '%s' "$IPSW_URL" | cut -d/ -f3)"
+          echo "ipsw      : $IPSW_VERSION"
+          echo "zstd      : -$ZSTD_LEVEL $ZSTD_EXTRA  (verify=$VERIFY)"
+
+      - name: Report starting disk budget
+        run: |
+          set -euo pipefail
+          echo "Budget assumption: ~86 GB free of a 145 GB root, peak payload 23.5 GiB."
+          df -h /
+          df -h /mnt || true
+          nproc
+          free -h
+
+      - name: Reclaim disk space (opt-in)
+        if: ${{ inputs.reclaim_disk }}
+        run: |
+          set -uo pipefail
+          # Inline rather than jlumbroso/free-disk-space@main: that action
+          # tracks a branch, which is both a supply-chain surface and a
+          # reproducibility hole (F5).
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+                      /usr/local/.ghcup /opt/hostedtoolcache/CodeQL || true
+          sudo docker image prune --all --force || true
+          df -h /
+
+      - name: Install system dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake git pkg-config \
+            libfuse3-dev fuse3 zlib1g-dev libbz2-dev libattr1-dev libacl1-dev \
+            attr acl curl jq zstd
+          tar --version | head -n 1
+          zstd --version
+
+      - name: Build apfs-fuse and record its commit
+        run: |
+          set -euo pipefail
+          git clone --recursive https://github.com/sgan81/apfs-fuse.git /tmp/apfs-fuse
+          APFS_FUSE_SHA=$(git -C /tmp/apfs-fuse rev-parse HEAD)
+          echo "APFS_FUSE_SHA=$APFS_FUSE_SHA" >> "$GITHUB_ENV"
+          echo "apfs-fuse commit: $APFS_FUSE_SHA"
+          cmake -S /tmp/apfs-fuse -B /tmp/apfs-fuse/build -DCMAKE_BUILD_TYPE=Release
+          cmake --build /tmp/apfs-fuse/build -j "$(nproc)"
+          # package_minimal_rootfs.yml copies apfs-* only, which silently drops
+          # apfsutil. We need it to log the container's volume list.
+          sudo find /tmp/apfs-fuse/build -maxdepth 1 -type f -perm -u+x \
+               \( -name 'apfs-*' -o -name 'apfsutil' \) -exec cp {} /usr/local/bin/ \;
+          command -v apfs-fuse
+          command -v apfsutil || echo "::warning title=No apfsutil::volume lists will be skipped"
+
+      - name: Install pinned ipsw CLI
+        run: |
+          set -euo pipefail
+          VER="$IPSW_VERSION"
+          if [ "$VER" = "latest" ]; then
+            VER=$(curl -fsSL https://api.github.com/repos/blacktop/ipsw/releases/latest | jq -r .tag_name | sed 's/^v//')
+            echo "::warning title=Unpinned ipsw::resolved latest to ${VER}; pin ipsw_version for reproducible runs"
+          fi
+          curl -fL --retry 3 -o /tmp/ipsw.deb \
+            "https://github.com/blacktop/ipsw/releases/download/v${VER}/ipsw_${VER}_linux_x86_64.deb"
+          sudo dpkg -i /tmp/ipsw.deb
+          ipsw version
+          echo "IPSW_RESOLVED_VERSION=$VER" >> "$GITHUB_ENV"
+
+      - name: Create workspace and open the reports
+        run: |
+          set -euo pipefail
+          mkdir -p "$WORK"/{bootkit,mtree,aea,dec,mnt_rootfs,mnt_sys,mnt_app,mnt_base,mnt_rdisk}
+          mkdir -p "$REPORTS" out/bootkit out/mtree out/rootfs out/sys out/app out/base out/rdisk
+          : > "$MISSING_FILE"
+          : > "$REPORTS/pack_summary.txt"
+          : > "$REPORTS/artifact_manifest.jsonl"
+          : > "$REPORTS/SHA256SUMS.txt"
+          : > "$REPORTS/disk_watermarks.txt"
+          chmod +x pack_full_volume.sh aea_decrypt.sh
+          {
+            echo "run      : ${{ github.run_id }} attempt ${{ github.run_attempt }}"
+            echo "repo     : ${{ github.repository }}"
+            echo "sha      : ${{ github.sha }}"
+            echo "ipsw     : ${IPSW_RESOLVED_VERSION}"
+            echo "apfsfuse : ${APFS_FUSE_SHA}"
+            echo "zstd     : -${ZSTD_LEVEL} ${ZSTD_EXTRA}"
+            echo "verify   : ${VERIFY}"
+            echo "runner   : $(uname -srm), $(nproc) cpus"
+            echo "tar      : $(tar --version | head -n 1)"
+            echo "zstd cli : $(zstd --version)"
+          } | tee "$REPORTS/run_environment.txt"
+
+      # =======================================================================
+      # Small objects first. They are what Gates A-D need, they total well
+      # under 200 MB, and uploading them before anything heavy runs means a
+      # later failure cannot take them down with it (F4).
+      # =======================================================================
+      - name: Extract boot kit (kernelcache, DeviceTree, TrustCache, root_hash, apticket)
+        run: |
+          set -uo pipefail
+          B="$WORK/bootkit"
+
+          echo "::group::vma2 kernelcache"
+          ipsw extract --remote "$IPSW_URL" -k --pattern '.*vma2.*' -o "$B" || true
+          KC=$(find "$B" -type f -name 'kernelcache.release.vma2' | head -n 1)
+          if [ -z "$KC" ]; then
+            echo "::error title=No kernelcache::no kernelcache.release.vma2 in the remote IPSW"
+            echo "BOOTKIT_KERNELCACHE_MISSING" >> "$MISSING_FILE"
+          else
+            cp "$KC" out/bootkit/kernelcache.release.vma2.im4p
+            ipsw kernel dec "$KC" -o "$B/kernelcache.vma2.dec" || true
+            if [ -s "$B/kernelcache.vma2.dec" ]; then
+              cp "$B/kernelcache.vma2.dec" out/bootkit/kernelcache.vma2.dec
+            elif [ -s "${KC}.decompressed" ]; then
+              cp "${KC}.decompressed" out/bootkit/kernelcache.vma2.dec
+            else
+              echo "::warning title=Kernelcache not decompressed::shipping the im4p only"
+              echo "BOOTKIT_KERNELCACHE_NOT_DECOMPRESSED" >> "$MISSING_FILE"
+            fi
+          fi
+          echo "::endgroup::"
+
+          echo "::group::DeviceTree"
+          ipsw extract --remote "$IPSW_URL" --dtree -o "$B" || true
+          DT=$(find "$B" -type f -name '*DeviceTree*vma2*' | head -n 1)
+          [ -z "$DT" ] && DT=$(find "$B" -type f -name '*vma2macosap*im4p' | head -n 1)
+          if [ -n "$DT" ]; then
+            cp "$DT" out/bootkit/DeviceTree.vma2macosap.im4p
+          else
+            echo "::warning title=No DeviceTree::--dtree produced no vma2 device tree"
+            echo "BOOTKIT_DEVICETREE_MISSING" >> "$MISSING_FILE"
+          fi
+          echo "::endgroup::"
+
+          echo "::group::TrustCache + root_hash"
+          # These are ordinary zip members, under 410 KB in total, and not one of
+          # them has ever been extracted before (docs/ipsw-extraction.md 3.3).
+          ipsw extract --remote "$IPSW_URL" --pattern '.*\.(trustcache|root_hash)$' -o "$B" || true
+          echo "::endgroup::"
+
+          echo "::group::apticket + BuildManifest"
+          ipsw extract --remote "$IPSW_URL" --pattern '.*apticket\.vma2macosap\.im4m$' -o "$B" || true
+          ipsw extract --remote "$IPSW_URL" --pattern '.*BuildManifest\.plist$' -o "$B" || true
+          echo "::endgroup::"
+
+          # Flatten, but keep the apticket variant in the name: the two tickets
+          # share a basename and differ only by their restore/ subdirectory.
+          while IFS= read -r -d '' F; do
+            case "$F" in
+              *apticket*)
+                VAR=$(printf '%s' "$F" | sed -E 's#.*/restore/##; s#/[^/]+$##; s#[^A-Za-z0-9]+#_#g')
+                cp "$F" "out/bootkit/apticket.vma2macosap.${VAR}.im4m"
+                ;;
+              *) cp "$F" "out/bootkit/$(basename "$F")" ;;
+            esac
+          done < <(find "$B" -type f \( -name '*.trustcache' -o -name '*.root_hash' \
+                      -o -name '*apticket*.im4m' -o -name 'BuildManifest.plist' \) -print0)
+
+          N_TC=$(find out/bootkit -name '*.trustcache' | wc -l)
+          N_RH=$(find out/bootkit -name '*.root_hash' | wc -l)
+          N_TK=$(find out/bootkit -name '*apticket*' | wc -l)
+          [ "$N_TC" -eq 0 ] && echo "BOOTKIT_TRUSTCACHE_MISSING" >> "$MISSING_FILE"
+          [ "$N_RH" -eq 0 ] && echo "BOOTKIT_ROOT_HASH_MISSING" >> "$MISSING_FILE"
+          [ "$N_TK" -eq 0 ] && echo "BOOTKIT_APTICKET_MISSING" >> "$MISSING_FILE"
+
+          {
+            echo "trustcaches : $N_TC"
+            echo "root_hashes : $N_RH"
+            echo "apticket    : $N_TK"
+            echo ""
+            ls -l out/bootkit
+            echo ""
+            ( cd out/bootkit && sha256sum ./* )
+          } | tee "$REPORTS/bootkit_inventory.txt"
+          ( cd out/bootkit && sha256sum ./* | sed 's#\./##' ) >> "$REPORTS/SHA256SUMS.txt"
+          echo "bootkit $(du -sh out/bootkit | cut -f1) :: $(df -h / | tail -1)" >> "$REPORTS/disk_watermarks.txt"
+          df -h /
+
+      - name: Upload vma2-bootkit
+        uses: actions/upload-artifact@v4
+        with:
+          name: vma2-bootkit
+          path: out/bootkit/*
+          retention-days: 90
+          if-no-files-found: error
+          compression-level: 6
+
+      - name: Extract mtree (authoritative root volume file list)
+        run: |
+          set -uo pipefail
+          # 71.9 MB, never extracted before, and the only way to learn the root
+          # volume's real inventory without APFS (docs/ipsw-extraction.md 7.1).
+          ipsw extract --remote "$IPSW_URL" --pattern '.*\.mtree$' -o "$WORK/mtree" || true
+          FOUND=0
+          while IFS= read -r -d '' F; do
+            cp "$F" "out/mtree/$(basename "$F")"
+            FOUND=1
+          done < <(find "$WORK/mtree" -type f -name '*.mtree' -print0)
+          if [ "$FOUND" -eq 0 ]; then
+            echo "::warning title=No mtree::--pattern '.*\.mtree$' matched nothing"
+            echo "MTREE_MISSING" >> "$MISSING_FILE"
+          fi
+          { ls -l out/mtree; ( cd out/mtree && sha256sum ./* 2>/dev/null ); } \
+            | tee "$REPORTS/mtree_inventory.txt"
+          ( cd out/mtree && sha256sum ./* 2>/dev/null | sed 's#\./##' ) >> "$REPORTS/SHA256SUMS.txt"
+          rm -rf "$WORK/mtree"
+          df -h /
+
+      - name: Upload vma2-mtree
+        uses: actions/upload-artifact@v4
+        with:
+          name: vma2-mtree
+          path: out/mtree/*
+          retention-days: 90
+          if-no-files-found: warn
+          compression-level: 6
+
+      # =======================================================================
+      # Root volume. The `OS` object, 9.63 GiB encrypted / 12.24 GiB decrypted.
+      # Never extracted before in this project: this is the core of the run.
+      # =======================================================================
+      - name: 'Root volume: fetch, decrypt, tar'
+        run: |
+          set -euo pipefail
+          ipsw extract --remote "$IPSW_URL" --dmg fs -o "$WORK/aea"
+          ls -l "$WORK/aea"
+          df -h /
+          AEA=$(find "$WORK/aea" -type f -name '*.dmg.aea' | head -n 1)
+          if [ -n "$AEA" ]; then
+            ./aea_decrypt.sh "$AEA" "$WORK/dec" "$MISSING_FILE"
+          else
+            PLAIN=$(find "$WORK/aea" -type f -name '*.dmg' | head -n 1)
+            if [ -z "$PLAIN" ]; then
+              echo "::error title=No root volume::--dmg fs produced neither .dmg.aea nor .dmg"
+              echo "ROOTFS_CONTAINER_MISSING" >> "$MISSING_FILE"
+              exit 1
+            fi
+            echo "::warning title=Root volume was not encrypted::shipping it as-is"
+            echo "ROOTFS_NOT_AEA_ENCRYPTED $(basename "$PLAIN")" >> "$MISSING_FILE"
+            mv "$PLAIN" "$WORK/dec/"
+          fi
+          DMG=$(find "$WORK/dec" -type f -name '*.dmg' | head -n 1)
+          echo "ROOTFS_DMG=$DMG" >> "$GITHUB_ENV"
+          ./pack_full_volume.sh "$DMG" "$WORK/mnt_rootfs" \
+             "out/rootfs/vma2-rootfs-full.tar.zst" rootfs "$REPORTS"
+          echo "rootfs :: $(df -h / | tail -1)" >> "$REPORTS/disk_watermarks.txt"
+          ls -l out/rootfs
+
+      - name: Upload vma2-rootfs-full
+        uses: actions/upload-artifact@v4
+        with:
+          name: vma2-rootfs-full
+          path: out/rootfs/*
+          retention-days: 30
+          if-no-files-found: error
+          # Already zstd; deflating it again would burn minutes for ~0.5%.
+          compression-level: 0
+
+      - name: 'Root volume: reclaim'
+        run: |
+          set -uo pipefail
+          rm -f out/rootfs/*.tar.zst
+          rm -rf "$WORK/dec" "$WORK/aea"
+          mkdir -p "$WORK/dec" "$WORK/aea"
+          echo "after rootfs cleanup :: $(df -h / | tail -1)" >> "$REPORTS/disk_watermarks.txt"
+          df -h /
+
+      # =======================================================================
+      # Cryptex1,SystemOS. 5.75 GiB encrypted / 6.63 GiB decrypted. Holds the
+      # 5.42 GiB dyld shared cache that cannot be carved out byte-wise because
+      # APFS stores it compressed (docs/ipsw-extraction.md 6.2).
+      # =======================================================================
+      - name: 'SystemOS cryptex: fetch, decrypt, tar'
+        run: |
+          set -euo pipefail
+          ipsw extract --remote "$IPSW_URL" --dmg sys -o "$WORK/aea"
+          ls -l "$WORK/aea"
+          AEA=$(find "$WORK/aea" -type f -name '*.dmg.aea' | head -n 1)
+          if [ -n "$AEA" ]; then
+            ./aea_decrypt.sh "$AEA" "$WORK/dec" "$MISSING_FILE"
+          else
+            PLAIN=$(find "$WORK/aea" -type f -name '*.dmg' | head -n 1)
+            if [ -z "$PLAIN" ]; then
+              echo "::error title=No SystemOS cryptex::--dmg sys produced nothing"
+              echo "CRYPTEX_SYS_CONTAINER_MISSING" >> "$MISSING_FILE"
+              exit 1
+            fi
+            echo "CRYPTEX_SYS_NOT_AEA_ENCRYPTED $(basename "$PLAIN")" >> "$MISSING_FILE"
+            mv "$PLAIN" "$WORK/dec/"
+          fi
+          DMG=$(find "$WORK/dec" -type f -name '*.dmg' | head -n 1)
+          ./pack_full_volume.sh "$DMG" "$WORK/mnt_sys" \
+             "out/sys/vma2-cryptex-sys.tar.zst" cryptex-sys "$REPORTS"
+          echo "cryptex-sys :: $(df -h / | tail -1)" >> "$REPORTS/disk_watermarks.txt"
+          ls -l out/sys
+
+      - name: Upload vma2-cryptex-sys
+        uses: actions/upload-artifact@v4
+        with:
+          name: vma2-cryptex-sys
+          path: out/sys/*
+          retention-days: 30
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: 'SystemOS cryptex: reclaim'
+        run: |
+          set -uo pipefail
+          rm -f out/sys/*.tar.zst
+          rm -rf "$WORK/dec" "$WORK/aea"
+          mkdir -p "$WORK/dec" "$WORK/aea"
+          echo "after sys cleanup :: $(df -h / | tail -1)" >> "$REPORTS/disk_watermarks.txt"
+          df -h /
+
+      # =======================================================================
+      # Cryptex1,AppOS. 50 MiB, not AEA encrypted, still a bare APFS container.
+      # =======================================================================
+      - name: 'AppOS cryptex: fetch, tar'
+        run: |
+          set -euo pipefail
+          ipsw extract --remote "$IPSW_URL" --dmg app -o "$WORK/aea"
+          ls -l "$WORK/aea"
+          AEA=$(find "$WORK/aea" -type f -name '*.dmg.aea' | head -n 1)
+          if [ -n "$AEA" ]; then
+            ./aea_decrypt.sh "$AEA" "$WORK/dec" "$MISSING_FILE"
+          else
+            PLAIN=$(find "$WORK/aea" -type f -name '*.dmg' | head -n 1)
+            if [ -z "$PLAIN" ]; then
+              echo "::error title=No AppOS cryptex::--dmg app produced nothing"
+              echo "CRYPTEX_APP_CONTAINER_MISSING" >> "$MISSING_FILE"
+              exit 1
+            fi
+            mv "$PLAIN" "$WORK/dec/"
+          fi
+          DMG=$(find "$WORK/dec" -type f -name '*.dmg' | head -n 1)
+          ./pack_full_volume.sh "$DMG" "$WORK/mnt_app" \
+             "out/app/vma2-cryptex-app.tar.zst" cryptex-app "$REPORTS"
+          echo "cryptex-app :: $(df -h / | tail -1)" >> "$REPORTS/disk_watermarks.txt"
+          ls -l out/app
+
+      - name: Upload vma2-cryptex-app
+        uses: actions/upload-artifact@v4
+        with:
+          name: vma2-cryptex-app
+          path: out/app/*
+          retention-days: 30
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: 'AppOS cryptex: reclaim'
+        run: |
+          set -uo pipefail
+          rm -f out/app/*.tar.zst
+          rm -rf "$WORK/dec" "$WORK/aea"
+          mkdir -p "$WORK/dec" "$WORK/aea"
+          df -h /
+
+      # =======================================================================
+      # Optional extras, deliberately after everything else so they cannot
+      # delay or endanger the main path.
+      # =======================================================================
+      - name: 'BaseSystem: fetch, decrypt, tar (optional)'
+        if: ${{ inputs.include_basesystem }}
+        run: |
+          set -euo pipefail
+          # There is no `--dmg basesystem`; BaseSystem is reached by pattern.
+          ipsw extract --remote "$IPSW_URL" --pattern '.*022-[0-9]+-[0-9]+\.dmg\.aea$' -o "$WORK/aea"
+          AEA=$(find "$WORK/aea" -type f -name '*.dmg.aea' | head -n 1)
+          if [ -z "$AEA" ]; then
+            echo "::warning title=No BaseSystem::pattern matched nothing"
+            echo "BASESYSTEM_MISSING" >> "$MISSING_FILE"
+            exit 0
+          fi
+          ./aea_decrypt.sh "$AEA" "$WORK/dec" "$MISSING_FILE"
+          DMG=$(find "$WORK/dec" -type f -name '*.dmg' | head -n 1)
+          ./pack_full_volume.sh "$DMG" "$WORK/mnt_base" \
+             "out/base/vma2-basesystem.tar.zst" basesystem "$REPORTS"
+          echo "basesystem :: $(df -h / | tail -1)" >> "$REPORTS/disk_watermarks.txt"
+
+      - name: Upload vma2-basesystem (optional)
+        if: ${{ inputs.include_basesystem }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: vma2-basesystem
+          path: out/base/*
+          retention-days: 30
+          if-no-files-found: warn
+          compression-level: 0
+
+      - name: 'BaseSystem: reclaim (optional)'
+        if: ${{ inputs.include_basesystem }}
+        run: |
+          set -uo pipefail
+          rm -f out/base/*.tar.zst
+          rm -rf "$WORK/dec" "$WORK/aea"
+          mkdir -p "$WORK/dec" "$WORK/aea"
+          df -h /
+
+      - name: 'RestoreRamDisk: fetch, tar (optional)'
+        if: ${{ inputs.include_ramdisk }}
+        run: |
+          set -euo pipefail
+          ipsw extract --remote "$IPSW_URL" --dmg rdisk --ident Erase -o "$WORK/aea" || \
+            ipsw extract --remote "$IPSW_URL" --dmg rdisk -o "$WORK/aea"
+          AEA=$(find "$WORK/aea" -type f -name '*.dmg.aea' | head -n 1)
+          if [ -n "$AEA" ]; then
+            ./aea_decrypt.sh "$AEA" "$WORK/dec" "$MISSING_FILE"
+          else
+            PLAIN=$(find "$WORK/aea" -type f -name '*.dmg' | head -n 1)
+            if [ -z "$PLAIN" ]; then
+              echo "::warning title=No RestoreRamDisk::--dmg rdisk produced nothing"
+              echo "RAMDISK_MISSING" >> "$MISSING_FILE"
+              exit 0
+            fi
+            mv "$PLAIN" "$WORK/dec/"
+          fi
+          DMG=$(find "$WORK/dec" -type f -name '*.dmg' | head -n 1)
+          # The ramdisk may be HFS+ rather than APFS, in which case apfs-fuse
+          # cannot mount it. Record that instead of failing the job, and ship
+          # the raw container so it is at least in hand.
+          if ! ./pack_full_volume.sh "$DMG" "$WORK/mnt_rdisk" \
+                 "out/rdisk/vma2-ramdisk.tar.zst" ramdisk "$REPORTS"; then
+            echo "::warning title=RamDisk not mountable by apfs-fuse::shipping the raw container"
+            echo "RAMDISK_NOT_APFS shipped raw container instead of a tar" >> "$MISSING_FILE"
+            cp "$DMG" out/rdisk/
+            ( cd out/rdisk && sha256sum ./* | sed 's#\./##' ) >> "$REPORTS/SHA256SUMS.txt"
+          fi
+
+      - name: Upload vma2-ramdisk (optional)
+        if: ${{ inputs.include_ramdisk }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: vma2-ramdisk
+          path: out/rdisk/*
+          retention-days: 30
+          if-no-files-found: warn
+          compression-level: 0
+
+      # =======================================================================
+      # Reports. Always run, always uploaded: if a container step blew up, the
+      # mount tree and the missing-components list are exactly what is needed
+      # to find out why.
+      # =======================================================================
+      - name: Assemble reports and Step Summary
+        if: always()
+        run: |
+          set -uo pipefail
+          mkdir -p "$REPORTS"
+          echo "final :: $(df -h / | tail -1)" >> "$REPORTS/disk_watermarks.txt"
+          sudo chown -R "$(id -u):$(id -g)" "$REPORTS" out 2>/dev/null || true
+
+          MISSING_COUNT=0
+          if [ -s "$MISSING_FILE" ]; then
+            MISSING_COUNT=$(grep -cve '^[[:space:]]*$' "$MISSING_FILE" || echo 0)
+          fi
+
+          {
+            echo "## Full 25G83 vma2 extraction"
+            echo ""
+            echo "| field | value |"
+            echo "| :-- | :-- |"
+            echo "| ipsw | \`${IPSW_RESOLVED_VERSION:-unknown}\` |"
+            echo "| apfs-fuse commit | \`${APFS_FUSE_SHA:-unknown}\` |"
+            echo "| compression | \`zstd -${ZSTD_LEVEL} ${ZSTD_EXTRA}\` |"
+            echo "| archives verified | \`${VERIFY}\` |"
+            echo "| BaseSystem included | \`${{ inputs.include_basesystem }}\` |"
+            echo "| RamDisk included | \`${{ inputs.include_ramdisk }}\` |"
+            echo ""
+
+            # This block is the whole point of requirement 5: a degraded branch
+            # has to be visible on the summary page, not buried in a log.
+            if [ "$MISSING_COUNT" -gt 0 ]; then
+              echo "### :warning: missing_components (${MISSING_COUNT})"
+              echo ""
+              echo '```'
+              cat "$MISSING_FILE"
+              echo '```'
+            else
+              echo "### missing_components: none"
+            fi
+            echo ""
+
+            if [ -s "$REPORTS/pack_summary.txt" ]; then
+              echo "### Archives"
+              echo '```'
+              cat "$REPORTS/pack_summary.txt"
+              echo '```'
+            fi
+
+            if [ -s "$REPORTS/SHA256SUMS.txt" ]; then
+              echo "### SHA-256"
+              echo '```'
+              cat "$REPORTS/SHA256SUMS.txt"
+              echo '```'
+            fi
+
+            echo "### Disk watermarks"
+            echo '```'
+            cat "$REPORTS/disk_watermarks.txt" 2>/dev/null
+            echo '```'
+
+            echo "### /etc probes per mount"
+            for T in "$REPORTS"/mount_tree_*.txt; do
+              [ -f "$T" ] || continue
+              echo ""
+              echo "#### $(basename "$T")"
+              echo '```'
+              sed -n '/--- path probes/,/^--- every dyld/p' "$T" | head -n 80
+              echo '```'
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "missing_components: $MISSING_COUNT"
+          cat "$MISSING_FILE" || true
+          ls -lR "$REPORTS" | head -n 100
+
+      - name: Upload vma2-reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vma2-reports
+          path: reports/*
+          retention-days: 90
+          if-no-files-found: warn
+          compression-level: 9
+
+      # Last step on purpose: every artifact is already uploaded, so failing
+      # here loses nothing. The point is that a run which quietly degraded can
+      # never finish green again. Run 40319004513 reported SUCCESS while its
+      # /private/etc had been replaced by a two-line synthetic passwd (F1).
+      - name: Fail the run if anything degraded
+        if: always()
+        run: |
+          set -uo pipefail
+          if [ ! -s "$MISSING_FILE" ]; then
+            echo "missing_components is empty."
+            exit 0
+          fi
+          echo "--- missing_components.txt ---"
+          cat "$MISSING_FILE"
+          HARD='_MISSING|_FAILED|KEY_EMPTY|NO_OUTPUT|UNREADABLE|NEARLY_EMPTY|TAR_FATAL|ZSTD_FAILED|MEMBER_COUNT_DRIFT|VERIFY_SKIPPED|NOT_AEA_ENCRYPTED|NOT_DECOMPRESSED|NOT_APFS'
+          if grep -qE "$HARD" "$MISSING_FILE"; then
+            echo ""
+            echo "::error title=Degraded extraction::reports/missing_components.txt has hard entries; the artifacts are usable but incomplete. See the Step Summary."
+            grep -E "$HARD" "$MISSING_FILE"
+            exit 1
+          fi
+          echo ""
+          echo "Only soft entries (tar diagnostics); treating the run as complete."

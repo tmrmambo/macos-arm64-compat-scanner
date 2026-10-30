@@ -1,0 +1,377 @@
+name: Package vma2 Boot Kit (v2)
+
+# Draft replacement for package_minimal_rootfs.yml.
+# See ../../../docs/cloud-extraction.md for the audit this workflow answers.
+#
+# Differences from package_minimal_rootfs.yml (which is left untouched):
+#   F3  disk image is opt-in, so the default artifact is ~1.75 GB instead of 22.37 GB
+#   F4  TrustCache + apticket are extracted and shipped as their own small artifact
+#   F1  mount points are dumped so a missing /private/etc can be diagnosed
+#   F5  ipsw is pinned, apfs-fuse commit is recorded, no unpinned third-party action
+#   F6  the AEA key is masked instead of echoed, and an empty key fails the job
+#   gap /private/etc, LaunchDaemons, xpc, libexec, SystemVersion.plist are back-filled
+
+on:
+  workflow_dispatch:
+    inputs:
+      ipsw_url:
+        description: 'Apple official macOS IPSW URL (must support HTTP Range)'
+        required: true
+        default: 'https://updates.cdn-apple.com/2026SummerFCS/fullrestores/140-75212/A2A24B94-1FC1-45A3-93F7-C51B02AF1F4D/UniversalMac_26.6.2_25G83_Restore.ipsw'
+      ipsw_version:
+        description: 'Pinned blacktop/ipsw release (no leading v). Use "latest" to float.'
+        required: true
+        default: '3.1.739'
+      build_disk_image:
+        description: 'Also build the 12.8 GB GPT raw/qcow2 disk. Off by default: the image is a pristine root container with no cryptex and an ESP with no EFI loader, so it cannot boot yet.'
+        required: true
+        type: boolean
+        default: false
+
+jobs:
+  package-boot-kit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    env:
+      IPSW_URL: ${{ inputs.ipsw_url }}
+      IPSW_VERSION: ${{ inputs.ipsw_version }}
+      WORK: /tmp/work
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Report Starting Disk Budget
+        run: |
+          set -euo pipefail
+          echo "Runner disk at job start (the documented 14 GB SSD spec does not match the image):"
+          df -h /
+          df -h /mnt || true
+
+      - name: Reclaim Disk Space (only when building the disk image)
+        if: ${{ inputs.build_disk_image }}
+        run: |
+          set -uo pipefail
+          # Inline instead of a third-party action pinned to a moving branch.
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup || true
+          sudo docker image prune --all --force || true
+          df -h /
+
+      - name: Install System Dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          PKGS="build-essential cmake git libfuse3-dev zlib1g-dev libbz2-dev libattr1-dev curl jq zstd"
+          if [ "${{ inputs.build_disk_image }}" = "true" ]; then
+            PKGS="$PKGS qemu-utils dosfstools mtools gdisk"
+          fi
+          sudo apt-get install -y $PKGS
+
+      - name: Build apfs-fuse and Record Its Commit
+        run: |
+          set -euo pipefail
+          git clone --recursive https://github.com/sgan81/apfs-fuse.git /tmp/apfs-fuse
+          APFS_FUSE_SHA=$(git -C /tmp/apfs-fuse rev-parse HEAD)
+          echo "APFS_FUSE_SHA=$APFS_FUSE_SHA" >> "$GITHUB_ENV"
+          echo "apfs-fuse commit: $APFS_FUSE_SHA"
+          cmake -S /tmp/apfs-fuse -B /tmp/apfs-fuse/build
+          cmake --build /tmp/apfs-fuse/build -j "$(nproc)"
+          sudo cp /tmp/apfs-fuse/build/apfs-* /usr/local/bin/
+          command -v apfs-fuse
+
+      - name: Install Pinned ipsw CLI
+        run: |
+          set -euo pipefail
+          VER="$IPSW_VERSION"
+          if [ "$VER" = "latest" ]; then
+            VER=$(curl -fsSL https://api.github.com/repos/blacktop/ipsw/releases/latest | jq -r .tag_name | sed 's/^v//')
+            echo "::warning title=Unpinned ipsw::Resolved latest to ${VER}; pin ipsw_version for reproducible runs."
+          fi
+          echo "Installing ipsw v${VER}"
+          curl -fL -o /tmp/ipsw.deb "https://github.com/blacktop/ipsw/releases/download/v${VER}/ipsw_${VER}_linux_x86_64.deb"
+          sudo dpkg -i /tmp/ipsw.deb
+          ipsw version
+          echo "IPSW_RESOLVED_VERSION=$VER" >> "$GITHUB_ENV"
+
+      - name: Create Workspace Directories
+        run: |
+          set -euo pipefail
+          mkdir -p "$WORK"/{sys_aea,sys_dmg,fs_aea,fs_dmg,mnt_sys,mnt_fs,bootkit,minimal_rootfs}
+          mkdir -p artifacts reports
+
+      # ------------------------------------------------------------------
+      # Boot assets go first and ship on their own: they are ~80 MB, they are
+      # what Gates A-D actually need, and a later failure must not lose them.
+      # ------------------------------------------------------------------
+      - name: Extract Boot Assets (Kernelcache, DeviceTree, TrustCache, apticket)
+        run: |
+          set -euo pipefail
+          cd "$WORK/bootkit"
+
+          echo ">>> vma2 kernelcache"
+          ipsw extract --remote "$IPSW_URL" -k --pattern '.*vma2.*' -o "$WORK/bootkit" || true
+          KC=$(find "$WORK/bootkit" -name 'kernelcache.release.vma2' | head -n 1)
+          if [ -z "$KC" ]; then
+            echo "::error title=No kernelcache::vma2 kernelcache not found in the remote IPSW."
+            exit 1
+          fi
+          ipsw kernel dec "$KC" -o artifacts_kc.dec 2>/dev/null || ipsw kernel dec "$KC"
+          if [ -f artifacts_kc.dec ]; then
+            cp artifacts_kc.dec "$GITHUB_WORKSPACE/artifacts/kernelcache.vma2.dec"
+          else
+            cp "${KC}.decompressed" "$GITHUB_WORKSPACE/artifacts/kernelcache.vma2.dec"
+          fi
+
+          echo ">>> DeviceTree"
+          ipsw extract --remote "$IPSW_URL" --dtree -o "$WORK/bootkit" || true
+          DT=$(find "$WORK/bootkit" -name '*vma2*' -name '*DeviceTree*' | head -n 1)
+          [ -n "$DT" ] && cp "$DT" "$GITHUB_WORKSPACE/artifacts/DeviceTree.vma2macosap.im4p"
+
+          echo ">>> TrustCaches (project-scope.md phase 1 requires these)"
+          ipsw extract --remote "$IPSW_URL" --pattern '.*\.trustcache$' -o "$WORK/bootkit" || true
+
+          echo ">>> apticket / IMG4 manifests"
+          ipsw extract --remote "$IPSW_URL" --pattern '.*apticket.*\.im4m$' -o "$WORK/bootkit" || true
+
+          find "$WORK/bootkit" -type f \( -name '*.trustcache' -o -name '*.im4m' \) -print0 \
+            | xargs -0 -I{} cp {} "$GITHUB_WORKSPACE/artifacts/" 2>/dev/null || true
+
+          echo "--- boot kit contents ---"
+          ls -lh "$GITHUB_WORKSPACE/artifacts/"
+          if ! ls "$GITHUB_WORKSPACE/artifacts/" | grep -q trustcache; then
+            echo "::warning title=No TrustCache::--pattern extraction produced no trustcache; check ipsw extract --help for a flag change."
+          fi
+
+      - name: Upload Boot Kit Artifact (small, long retention)
+        uses: actions/upload-artifact@v4
+        with:
+          name: vma2-esp-bootkit
+          path: artifacts/*
+          retention-days: 90
+          if-no-files-found: error
+
+      # ------------------------------------------------------------------
+      # Userland containers
+      # ------------------------------------------------------------------
+      - name: Extract and Decrypt SystemOS Cryptex DMG
+        run: |
+          set -euo pipefail
+          ipsw extract --remote "$IPSW_URL" --dmg sys -o "$WORK/sys_aea"
+          AEA=$(find "$WORK/sys_aea" -name '*.dmg.aea' | head -n 1)
+          if [ -n "$AEA" ]; then
+            KEY=$(ipsw fw aea -k "$AEA" | grep 'base64:' | cut -d':' -f2 | tr -d '[:space:]')
+            if [ -z "$KEY" ]; then
+              echo "::error title=Empty AEA key::ipsw fw aea -k returned no base64 key. Output format may have changed."
+              exit 1
+            fi
+            echo "::add-mask::$KEY"
+            echo "WKMS key retrieved (masked, length ${#KEY})"
+            ipsw fw aea "$AEA" -o "$WORK/sys_dmg" --key-val "$KEY"
+            rm -f "$AEA"
+          else
+            find "$WORK/sys_aea" -name '*.dmg' -exec mv {} "$WORK/sys_dmg/" \;
+          fi
+          ls -lh "$WORK/sys_dmg"
+          df -h /
+
+      - name: Extract and Decrypt FileSystem Root DMG
+        run: |
+          set -euo pipefail
+          ipsw extract --remote "$IPSW_URL" --dmg fs -o "$WORK/fs_aea"
+          AEA=$(find "$WORK/fs_aea" -name '*.dmg.aea' | head -n 1)
+          if [ -n "$AEA" ]; then
+            KEY=$(ipsw fw aea -k "$AEA" | grep 'base64:' | cut -d':' -f2 | tr -d '[:space:]')
+            if [ -z "$KEY" ]; then
+              echo "::error title=Empty AEA key::ipsw fw aea -k returned no base64 key."
+              exit 1
+            fi
+            echo "::add-mask::$KEY"
+            echo "WKMS key retrieved (masked, length ${#KEY})"
+            ipsw fw aea "$AEA" -o "$WORK/fs_dmg" --key-val "$KEY"
+            rm -f "$AEA"
+          else
+            find "$WORK/fs_aea" -name '*.dmg' -exec mv {} "$WORK/fs_dmg/" \;
+          fi
+          ls -lh "$WORK/fs_dmg"
+          df -h /
+
+      - name: Mount Both APFS Containers
+        run: |
+          set -euo pipefail
+          SYS_DMG=$(find "$WORK/sys_dmg" -name '*.dmg' | head -n 1)
+          FS_DMG=$(find "$WORK/fs_dmg" -name '*.dmg' | head -n 1)
+          sudo apfs-fuse -o allow_other "$SYS_DMG" "$WORK/mnt_sys"
+          sudo apfs-fuse -o allow_other "$FS_DMG"  "$WORK/mnt_fs"
+          echo "SYS_DMG=$SYS_DMG" >> "$GITHUB_ENV"
+          echo "FS_DMG=$FS_DMG"   >> "$GITHUB_ENV"
+
+      # This is the step package_minimal_rootfs.yml lacks. Without it there is no
+      # way to tell from the log why package_rootfs.py fell back on a synthetic /etc.
+      - name: Dump Mount Trees (diagnoses the missing /private/etc)
+        run: |
+          set -uo pipefail
+          {
+            echo "=== apfs-fuse commit: ${APFS_FUSE_SHA} ==="
+            echo "=== ipsw version: ${IPSW_RESOLVED_VERSION} ==="
+            for M in "$WORK/mnt_fs" "$WORK/mnt_sys"; do
+              echo ""
+              echo "=== $M (depth 3 directories) ==="
+              sudo find "$M" -maxdepth 3 -type d 2>/dev/null | head -n 400
+              echo "--- $M: does private/etc resolve? ---"
+              for CAND in private/etc root/private/etc etc root/etc; do
+                if sudo test -d "$M/$CAND"; then
+                  echo "DIR  $M/$CAND  ($(sudo ls -1 "$M/$CAND" 2>/dev/null | wc -l) entries)"
+                elif sudo test -L "$M/$CAND"; then
+                  echo "LINK $M/$CAND -> $(sudo readlink "$M/$CAND")"
+                else
+                  echo "MISS $M/$CAND"
+                fi
+              done
+            done
+          } | tee reports/mount_tree.txt
+
+      - name: Assemble Minimal RootFS
+        run: |
+          set -euo pipefail
+          sudo python3 package_rootfs.py \
+            --fs-mount "$WORK/mnt_fs" \
+            --sys-mount "$WORK/mnt_sys" \
+            --output-dir "$WORK/minimal_rootfs" \
+            --manifest reports/rootfs_manifest.json \
+            --report reports/rootfs_report.txt
+
+      # package_rootfs.py stops at launchd/dyld/zsh/sh/dsc. launchd as PID 1 also
+      # needs its bootstrap configuration, which that script never copies.
+      - name: Back-Fill launchd Bootstrap Configuration
+        run: |
+          set -uo pipefail
+          OUT="$WORK/minimal_rootfs"
+
+          resolve_root() {
+            if sudo test -d "$1/root"; then echo "$1/root"; else echo "$1"; fi
+          }
+          FSR=$(resolve_root "$WORK/mnt_fs")
+          SYR=$(resolve_root "$WORK/mnt_sys")
+          echo "fs root = $FSR ; sys root = $SYR"
+
+          : > reports/gap_report.txt
+          copy_path() {
+            REL="$1"
+            for SRC_ROOT in "$FSR" "$SYR"; do
+              SRC="$SRC_ROOT/$REL"
+              if sudo test -e "$SRC"; then
+                sudo mkdir -p "$OUT/$(dirname "$REL")"
+                if sudo cp -a "$SRC" "$OUT/$REL" 2>/dev/null; then
+                  SZ=$(sudo du -sh "$OUT/$REL" 2>/dev/null | cut -f1)
+                  echo "OK    /$REL  (from $SRC_ROOT, $SZ)" | tee -a reports/gap_report.txt
+                  return 0
+                fi
+              fi
+            done
+            echo "MISS  /$REL  (not present under either mount)" | tee -a reports/gap_report.txt
+            return 1
+          }
+
+          # Blocking gaps from the audit, in dependency order.
+          copy_path "private/etc"                                  || true
+          copy_path "System/Library/LaunchDaemons"                 || true
+          copy_path "System/Library/xpc"                           || true
+          copy_path "System/Library/CoreServices/SystemVersion.plist" || true
+          copy_path "usr/libexec"                                  || true
+          copy_path "usr/lib/libSystem.B.dylib"                    || true
+          copy_path "private/var/db/dyld"                          || true
+
+          # The packager globs dyld_shared_cache_arm64e* only. Record whether a
+          # plain (non-e) cache exists so the omission is a decision, not an accident.
+          echo "" | tee -a reports/gap_report.txt
+          echo "--- all dyld cache files visible on the mounts ---" | tee -a reports/gap_report.txt
+          for SRC_ROOT in "$SYR" "$FSR"; do
+            sudo ls -1 "$SRC_ROOT/System/Library/dyld" 2>/dev/null \
+              | sed "s|^|$SRC_ROOT/System/Library/dyld/|" | tee -a reports/gap_report.txt
+          done
+
+          echo "" | tee -a reports/gap_report.txt
+          echo "--- assembled rootfs size ---" | tee -a reports/gap_report.txt
+          sudo du -sh "$OUT" | tee -a reports/gap_report.txt
+          df -h /
+
+      - name: Package minimal_rootfs.tar.zst
+        run: |
+          set -euo pipefail
+          sudo tar -C "$WORK/minimal_rootfs" -cf - . | zstd -T0 -5 -o artifacts_rootfs.tar.zst
+          mkdir -p rootfs_out
+          mv artifacts_rootfs.tar.zst rootfs_out/minimal_rootfs.tar.zst
+          ls -lh rootfs_out/minimal_rootfs.tar.zst
+
+      - name: Build GPT Disk Image (opt-in)
+        if: ${{ inputs.build_disk_image }}
+        run: |
+          set -euo pipefail
+          echo "::warning title=Disk image is not bootable yet::Partition 2 is the pristine root container with no cryptex merged in, and the ESP has no BOOTAA64.EFI. See docs/cloud-extraction.md F2/F3."
+          mkdir -p "$WORK/esp_files"
+          cp artifacts/kernelcache.vma2.dec "$WORK/esp_files/" 2>/dev/null || true
+          cp artifacts/DeviceTree.vma2macosap.im4p "$WORK/esp_files/" 2>/dev/null || true
+          mkdir -p disk_out
+          chmod +x create_disk_image.sh
+          ./create_disk_image.sh "$FS_DMG" "$WORK/esp_files" \
+            disk_out/macos_minimal_disk.raw disk_out/macos_minimal_disk.qcow2
+          ls -lh disk_out/
+          df -h /
+
+      - name: Step Summary
+        if: always()
+        run: |
+          set -uo pipefail
+          {
+            echo "## vma2 Boot Kit (v2)"
+            echo ""
+            echo "- ipsw: \`${IPSW_RESOLVED_VERSION:-unknown}\`"
+            echo "- apfs-fuse commit: \`${APFS_FUSE_SHA:-unknown}\`"
+            echo "- disk image requested: \`${{ inputs.build_disk_image }}\`"
+            echo ""
+            if [ -f reports/gap_report.txt ]; then
+              echo "### Back-filled paths"
+              echo '```'
+              cat reports/gap_report.txt
+              echo '```'
+            fi
+            if [ -f reports/rootfs_report.txt ]; then
+              echo "### Packager report"
+              echo '```'
+              cat reports/rootfs_report.txt
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fix Artifact Permissions
+        if: always()
+        run: sudo chown -R "$USER:$USER" artifacts reports rootfs_out disk_out 2>/dev/null || true
+
+      - name: Upload Minimal RootFS Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vma2-minimal-rootfs
+          path: rootfs_out/*
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Upload Reports Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vma2-reports
+          path: reports/*
+          retention-days: 90
+          if-no-files-found: warn
+
+      - name: Upload Disk Image Artifact (opt-in)
+        if: ${{ always() && inputs.build_disk_image }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: vma2-disk-image
+          path: disk_out/*
+          retention-days: 7
+          if-no-files-found: warn
