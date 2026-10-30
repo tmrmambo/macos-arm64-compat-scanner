@@ -199,8 +199,14 @@ sudo tar -C "$MNT" \
         --format=posix \
         -cf - . 2>"$WARN" \
     | zstd -T0 "-${ZSTD_LEVEL}" ${ZSTD_EXTRA} -f -o "$OUT"
-TAR_RC=${PIPESTATUS[0]}
-ZSTD_RC=${PIPESTATUS[1]}
+# PIPESTATUS is rebuilt by every simple command, including the assignment that
+# reads it, so `TAR_RC=${PIPESTATUS[0]}` leaves a one-element array behind and
+# the next line sees PIPESTATUS[1] as unset. Under set -u that is fatal, and it
+# killed run 41045152598 after the 7.96 GiB tar had already been written. Copy
+# the whole array in one go.
+RCS=("${PIPESTATUS[@]}")
+TAR_RC=${RCS[0]:-0}
+ZSTD_RC=${RCS[1]:-0}
 WARN_LINES=$(wc -l < "$WARN" | tr -d ' ')
 
 echo "tar exit=$TAR_RC  zstd exit=$ZSTD_RC  tar diagnostics=$WARN_LINES lines"
@@ -235,23 +241,29 @@ UNCOMP_BYTES=0
 MEMBERS=0
 if [ "$VERIFY" = "1" ]; then
     echo "reading the archive back (this also proves it decompresses)"
+    # Nothing below aborts. The tar is the expensive thing and it already
+    # exists; a verification problem is recorded in missing_components so the
+    # run's final gate turns red, but the archive still gets uploaded and can
+    # be examined. Throwing away 8 GiB because a check stumbled is the wrong
+    # trade.
     UNCOMP_BYTES=$(zstd -dc "$OUT" | wc -c)
     if [ "${UNCOMP_BYTES:-0}" -le 0 ]; then
         echo "::error title=Archive unreadable::zstd -dc produced nothing for $OUT"
         note_missing "ARCHIVE_UNREADABLE ${LABEL}"
-        exit 1
-    fi
-    # Member list is saved: it is the authoritative statement of what shipped,
-    # and it costs one pass we are already paying for.
-    zstd -dc "$OUT" | tar -tf - 2>/dev/null \
-        | zstd -T0 -9 -f -o "$REPORTS/filelist_${LABEL}.txt.zst"
-    MEMBERS=$(zstd -dc "$REPORTS/filelist_${LABEL}.txt.zst" | wc -l)
-    echo "uncompressed : $UNCOMP_BYTES"
-    echo "members      : $MEMBERS (find counted $N_ENTRIES entries)"
-    DELTA=$((MEMBERS - N_ENTRIES))
-    if [ "${DELTA#-}" -gt $((N_ENTRIES / 50 + 16)) ]; then
-        echo "::warning title=Member count drift ($LABEL)::tar holds $MEMBERS members, find saw $N_ENTRIES entries"
-        note_missing "MEMBER_COUNT_DRIFT ${LABEL} tar=${MEMBERS} find=${N_ENTRIES}"
+        UNCOMP_BYTES=0
+    else
+        # The member list is the authoritative statement of what shipped, and
+        # it costs one pass we are already paying for.
+        zstd -dc "$OUT" | tar -tf - 2>/dev/null \
+            | zstd -T0 -9 -f -o "$REPORTS/filelist_${LABEL}.txt.zst"
+        MEMBERS=$(zstd -dc "$REPORTS/filelist_${LABEL}.txt.zst" 2>/dev/null | wc -l)
+        echo "uncompressed : $UNCOMP_BYTES"
+        echo "members      : $MEMBERS (find counted $N_ENTRIES entries)"
+        DELTA=$((MEMBERS - N_ENTRIES))
+        if [ "${DELTA#-}" -gt $((N_ENTRIES / 50 + 16)) ]; then
+            echo "::warning title=Member count drift ($LABEL)::tar holds $MEMBERS members, find saw $N_ENTRIES entries"
+            note_missing "MEMBER_COUNT_DRIFT ${LABEL} tar=${MEMBERS} find=${N_ENTRIES}"
+        fi
     fi
 else
     echo "VERIFY=0, skipping the read-back passes"
