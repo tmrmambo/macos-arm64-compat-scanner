@@ -171,6 +171,7 @@ jobs:
         if: ${{ inputs.reclaim_disk }}
         run: |
           set -uo pipefail
+          set +e
           # Inline rather than jlumbroso/free-disk-space@main: that action
           # tracks a branch, which is both a supply-chain surface and a
           # reproducibility hole (F5).
@@ -283,21 +284,34 @@ jobs:
       - name: Extract boot kit (kernelcache, DeviceTree, TrustCache, root_hash, apticket)
         run: |
           set -uo pipefail
+          # GitHub invokes every run block as `bash -e`, so errexit is already on
+          # and `set -uo pipefail` does not clear it. This step is supposed to
+          # record gaps rather than abort on them, so turn it off explicitly.
+          # Run 41043160466 died here precisely because of that.
+          set +e
           B="$WORK/bootkit"
 
-          echo "::group::vma2 kernelcache"
-          ipsw extract --remote "$IPSW_URL" -k --pattern '.*vma2.*' -o "$B" || true
+          echo "::group::vma2 kernelcache and boot chain"
+          # -k with --pattern pulls every kernelcache AND every zip member
+          # matching the pattern, so this one remote pass also yields the
+          # DeviceTree, both apticket manifests and iBoot/LLB/iBEC/iBSS.
+          ipsw extract --remote "$IPSW_URL" -k --pattern '.*vma2.*' -o "$B"
           KC=$(find "$B" -type f -name 'kernelcache.release.vma2' | head -n 1)
           if [ -z "$KC" ]; then
             echo "::error title=No kernelcache::no kernelcache.release.vma2 in the remote IPSW"
             echo "BOOTKIT_KERNELCACHE_MISSING" >> "$MISSING_FILE"
           else
             cp "$KC" out/bootkit/kernelcache.release.vma2.im4p
-            ipsw kernel dec "$KC" -o "$B/kernelcache.vma2.dec" || true
-            if [ -s "$B/kernelcache.vma2.dec" ]; then
-              cp "$B/kernelcache.vma2.dec" out/bootkit/kernelcache.vma2.dec
-            elif [ -s "${KC}.decompressed" ]; then
-              cp "${KC}.decompressed" out/bootkit/kernelcache.vma2.dec
+            # `ipsw kernel dec -o` takes a DIRECTORY despite its help text saying
+            # "Output file"; it writes <name>.decompressed inside it. Testing the
+            # result with -s matched that directory and cp then failed on it.
+            ipsw kernel dec "$KC" -o "$B/kcdec"
+            KCDEC=$(find "$B/kcdec" -type f -name '*decompressed*' 2>/dev/null | head -n 1)
+            if [ -z "$KCDEC" ] && [ -f "${KC}.decompressed" ]; then
+              KCDEC="${KC}.decompressed"
+            fi
+            if [ -n "$KCDEC" ] && [ -f "$KCDEC" ]; then
+              cp "$KCDEC" out/bootkit/kernelcache.vma2.dec
             else
               echo "::warning title=Kernelcache not decompressed::shipping the im4p only"
               echo "BOOTKIT_KERNELCACHE_NOT_DECOMPRESSED" >> "$MISSING_FILE"
@@ -306,30 +320,35 @@ jobs:
           echo "::endgroup::"
 
           echo "::group::DeviceTree"
-          ipsw extract --remote "$IPSW_URL" --dtree -o "$B" || true
-          DT=$(find "$B" -type f -name '*DeviceTree*vma2*' | head -n 1)
-          [ -z "$DT" ] && DT=$(find "$B" -type f -name '*vma2macosap*im4p' | head -n 1)
+          DT=$(find "$B" -type f -name 'DeviceTree.vma2macosap.im4p' | head -n 1)
+          if [ -z "$DT" ]; then
+            # Only pay for another remote pass if the pattern above missed it.
+            ipsw extract --remote "$IPSW_URL" --dtree -o "$B"
+            DT=$(find "$B" -type f -name '*DeviceTree*vma2*' | head -n 1)
+          fi
           if [ -n "$DT" ]; then
             cp "$DT" out/bootkit/DeviceTree.vma2macosap.im4p
           else
-            echo "::warning title=No DeviceTree::--dtree produced no vma2 device tree"
+            echo "::warning title=No DeviceTree::no vma2 device tree found"
             echo "BOOTKIT_DEVICETREE_MISSING" >> "$MISSING_FILE"
           fi
           echo "::endgroup::"
 
           echo "::group::TrustCache + root_hash"
-          # These are ordinary zip members, under 410 KB in total, and not one of
-          # them has ever been extracted before (docs/ipsw-extraction.md 3.3).
-          ipsw extract --remote "$IPSW_URL" --pattern '.*\.(trustcache|root_hash)$' -o "$B" || true
+          # Ordinary zip members, under 410 KB in total, and not one of them has
+          # ever been extracted before (docs/ipsw-extraction.md 3.3).
+          ipsw extract --remote "$IPSW_URL" --pattern '.*\.(trustcache|root_hash)$' -o "$B"
           echo "::endgroup::"
 
           echo "::group::apticket + BuildManifest"
-          ipsw extract --remote "$IPSW_URL" --pattern '.*apticket\.vma2macosap\.im4m$' -o "$B" || true
-          ipsw extract --remote "$IPSW_URL" --pattern '.*BuildManifest\.plist$' -o "$B" || true
+          if [ -z "$(find "$B" -type f -name '*apticket*.im4m' -print -quit)" ]; then
+            ipsw extract --remote "$IPSW_URL" --pattern '.*apticket\.vma2macosap\.im4m$' -o "$B"
+          fi
+          ipsw extract --remote "$IPSW_URL" --pattern '.*BuildManifest\.plist$' -o "$B"
           echo "::endgroup::"
 
-          # Flatten, but keep the apticket variant in the name: the two tickets
-          # share a basename and differ only by their restore/ subdirectory.
+          # Flatten into out/bootkit. The two apticket files share a basename and
+          # differ only by their restore/ subdirectory, so keep the variant.
           while IFS= read -r -d '' F; do
             case "$F" in
               *apticket*)
@@ -339,14 +358,16 @@ jobs:
               *) cp "$F" "out/bootkit/$(basename "$F")" ;;
             esac
           done < <(find "$B" -type f \( -name '*.trustcache' -o -name '*.root_hash' \
-                      -o -name '*apticket*.im4m' -o -name 'BuildManifest.plist' \) -print0)
+                      -o -name '*apticket*.im4m' -o -name 'BuildManifest.plist' \
+                      -o -name 'iBoot.vma2*.im4p' -o -name 'LLB.vma2*.im4p' \
+                      -o -name 'iBEC.vma2*.im4p' -o -name 'iBSS.vma2*.im4p' \) -print0)
 
           N_TC=$(find out/bootkit -name '*.trustcache' | wc -l)
           N_RH=$(find out/bootkit -name '*.root_hash' | wc -l)
           N_TK=$(find out/bootkit -name '*apticket*' | wc -l)
-          [ "$N_TC" -eq 0 ] && echo "BOOTKIT_TRUSTCACHE_MISSING" >> "$MISSING_FILE"
-          [ "$N_RH" -eq 0 ] && echo "BOOTKIT_ROOT_HASH_MISSING" >> "$MISSING_FILE"
-          [ "$N_TK" -eq 0 ] && echo "BOOTKIT_APTICKET_MISSING" >> "$MISSING_FILE"
+          if [ "$N_TC" -eq 0 ]; then echo "BOOTKIT_TRUSTCACHE_MISSING" >> "$MISSING_FILE"; fi
+          if [ "$N_RH" -eq 0 ]; then echo "BOOTKIT_ROOT_HASH_MISSING" >> "$MISSING_FILE"; fi
+          if [ "$N_TK" -eq 0 ]; then echo "BOOTKIT_APTICKET_MISSING" >> "$MISSING_FILE"; fi
 
           {
             echo "trustcaches : $N_TC"
@@ -359,7 +380,11 @@ jobs:
           } | tee "$REPORTS/bootkit_inventory.txt"
           ( cd out/bootkit && sha256sum ./* | sed 's#\./##' ) >> "$REPORTS/SHA256SUMS.txt"
           echo "bootkit $(du -sh out/bootkit | cut -f1) :: $(df -h / | tail -1)" >> "$REPORTS/disk_watermarks.txt"
+          # -k wrote all 13 other kernelcaches too, about 1.2 GB that is of no
+          # use here. Drop the scratch dir before the big containers arrive.
+          rm -rf "$B"
           df -h /
+          exit 0
 
       - name: Upload vma2-bootkit
         uses: actions/upload-artifact@v4
@@ -373,6 +398,7 @@ jobs:
       - name: Extract mtree (authoritative root volume file list)
         run: |
           set -uo pipefail
+          set +e   # see the boot kit step: GitHub forces bash -e
           # 71.9 MB, never extracted before, and the only way to learn the root
           # volume's real inventory without APFS (docs/ipsw-extraction.md 7.1).
           ipsw extract --remote "$IPSW_URL" --pattern '.*\.mtree$' -o "$WORK/mtree" || true
@@ -390,6 +416,7 @@ jobs:
           ( cd out/mtree && sha256sum ./* 2>/dev/null | sed 's#\./##' ) >> "$REPORTS/SHA256SUMS.txt"
           rm -rf "$WORK/mtree"
           df -h /
+          exit 0
 
       - name: Upload vma2-mtree
         uses: actions/upload-artifact@v4
@@ -444,6 +471,9 @@ jobs:
       - name: 'Root volume: reclaim'
         run: |
           set -uo pipefail
+          # set +e: the artifact is already uploaded, so a cleanup hiccup must
+          # not take the remaining containers down with it.
+          set +e
           rm -f out/rootfs/*.tar.zst
           rm -rf "$WORK/dec" "$WORK/aea"
           mkdir -p "$WORK/dec" "$WORK/aea"
@@ -491,6 +521,7 @@ jobs:
       - name: 'SystemOS cryptex: reclaim'
         run: |
           set -uo pipefail
+          set +e
           rm -f out/sys/*.tar.zst
           rm -rf "$WORK/dec" "$WORK/aea"
           mkdir -p "$WORK/dec" "$WORK/aea"
@@ -535,6 +566,7 @@ jobs:
       - name: 'AppOS cryptex: reclaim'
         run: |
           set -uo pipefail
+          set +e
           rm -f out/app/*.tar.zst
           rm -rf "$WORK/dec" "$WORK/aea"
           mkdir -p "$WORK/dec" "$WORK/aea"
@@ -576,6 +608,7 @@ jobs:
         if: ${{ inputs.include_basesystem }}
         run: |
           set -uo pipefail
+          set +e
           rm -f out/base/*.tar.zst
           rm -rf "$WORK/dec" "$WORK/aea"
           mkdir -p "$WORK/dec" "$WORK/aea"
@@ -630,6 +663,7 @@ jobs:
         if: always()
         run: |
           set -uo pipefail
+          set +e   # this step must produce a summary even after a failure
           mkdir -p "$REPORTS"
           echo "final :: $(df -h / | tail -1)" >> "$REPORTS/disk_watermarks.txt"
           sudo chown -R "$(id -u):$(id -g)" "$REPORTS" out 2>/dev/null || true
