@@ -1,0 +1,926 @@
+name: Full 25G83 vma2 image ARMv8.2-A sweep (A11)
+
+# =============================================================================
+# WHAT THIS CLOSES
+# =============================================================================
+# analysis/compat/kernelcache-sweep.md declares two gaps in its own section 10:
+#
+#   10.5  "the component closure is still not closed": only the BootKC was
+#         swept. AuxKC, the dyld shared cache and every subcache, Cryptex,
+#         Preboot, Recovery and the standalone Mach-O inside SystemOS were not.
+#   10.6  "the scan surface is limited to executable segments": the arm64e auth
+#         pointers and chained fixups in __DATA_CONST were never touched.
+#
+# This workflow sweeps the dyld shared cache and the root-volume Mach-O corpus,
+# and parses LC_DYLD_CHAINED_FIXUPS, with the same byte-terminal-state
+# accounting the BootKC report used, so the numbers are comparable rather than
+# merely additional.
+#
+# It does NOT touch scan.yml, package_minimal_rootfs.yml, package_bootkit_v2.yml
+# or extract_full_25G83.yml.
+#
+# -----------------------------------------------------------------------------
+# WHY THE INPUT DATA COMES FROM AN ARTIFACT BY DEFAULT
+# -----------------------------------------------------------------------------
+# Two options existed.
+#
+#   (a) re-extract the IPSW remotely in every run: ~30 min, self-contained,
+#       needs apfs-fuse + the WKMS AEA key.
+#   (b) download run 41049216524's artifacts: minutes, but vma2-rootfs-full and
+#       vma2-cryptex-sys carry retention-days: 30 and expire 2026-11-29.
+#
+# DEFAULT IS (b), for a reason that only shows up once the work is a matrix:
+# with (a) every one of the ~20 matrix jobs would have to re-fetch and re-mount
+# 15 GB of containers, or one job would have to extract and re-upload for the
+# others -- which IS (b), with an extra half hour bolted on the front. (a) also
+# drags in the apfs-fuse build and the AEA key on jobs that have no business
+# holding a decryption key.
+#
+# The expiry is handled, not ignored: `source: ipsw` re-runs the extraction in
+# the `prepare` job and republishes the containers into THIS run, so both paths
+# feed the identical downstream code. A missing donor artifact is a hard
+# failure that names the escape hatch; it never degrades quietly.
+#
+# -----------------------------------------------------------------------------
+# DISK BUDGET  (measured watermarks from extract_full_25G83.yml: ubuntu-latest
+# root is 145 GB with ~86 GB free at job start; peak there was 78G used / 67G
+# free. Same assumption here, re-asserted with `df -h /` after every phase.)
+# -----------------------------------------------------------------------------
+# JOB `prepare`  (the only job that handles the big containers)
+#
+#   phase                                       on disk (GiB)  running total
+#   toolchain + python + capstone                     0.4           0.4
+#   vma2-cryptex-sys.tar.zst   (measured 4.72)        4.72          5.1
+#   arm64e DSC group extracted (measured 5.47)        5.47         10.6   <-- A
+#   cryptex tar deleted                              -4.72          5.9
+#   dsc-arm64e.tar.zst  (zstd -9, est. 1.6)           1.6           7.5
+#   DSC group deleted after upload                   -5.47          2.0
+#   vma2-rootfs-full.tar.zst   (measured 7.96)        7.96         10.0
+#   rootfs unpacked            (measured 21.37 GB)   19.9          29.9   <-- PEAK
+#   rootfs tar deleted                               -7.96         21.9
+#   macho corpus tar.zst       (est. <= 2.0)          2.0          23.9
+#   unpacked rootfs deleted after upload            -19.9           4.0
+#
+#   PEAK = 29.9 GiB of payload on ~57 GB already used, i.e. about 32 GB
+#   decimal against 86 GB free -> ~54 GB headroom. No reclaim step needed,
+#   same conclusion extract_full_25G83.yml reached, so the branch-tracking
+#   third-party free-disk action stays out (F5).
+#
+#   With source=ipsw the peak shifts: the decrypted cryptex container (6.63)
+#   and the decrypted rootfs container (12.24) are never on disk together
+#   because aea_decrypt.sh deletes the .aea and the container is dropped after
+#   tar, exactly as in extract_full_25G83.yml. Peak there was 23.5 GiB, which
+#   is below this job's 29.9.
+#
+# JOB `sweep-dsc` (one per shard)
+#   dsc-arm64e.tar.zst 1.6 + extracted group 5.47 = 7.1 GiB, tar deleted after
+#   extraction -> 5.5 GiB steady. Every shard needs the WHOLE group, not just
+#   its own subcache: in a split cache LC_FUNCTION_STARTS and LC_SYMTAB live in
+#   the *.dyldlinkedit subcaches, so resolving an image's function entries
+#   means following a VA across files. Without that the roots fall back to
+#   direct BL targets and reachability gets weaker -- it still works, and the
+#   fallback is recorded per component, but the good data is cheap here.
+#
+# JOB `sweep-rootfs` (one per shard)
+#   macho-corpus.tar.zst 2.0 + unpacked corpus (est. 5) = 7 GiB.
+#
+# JOB `aggregate`
+#   all shard report artifacts, a few hundred MB.
+#
+# -----------------------------------------------------------------------------
+# MATRIX ARITHMETIC AND WHY IT HAS TO BE A MATRIX
+# -----------------------------------------------------------------------------
+# Measured single-core throughput of the sweeper, from the BootKC run recorded
+# in analysis/compat/kernelcache-sweep.md: 40,583,168 bytes in 116 s, i.e.
+# ~350 KB/s/core (capstone disasm_lite in CPython, five passes per segment).
+#
+# Measured arm64e dyld shared cache executable mapping bytes, from this
+# module's own partition proof on the 25G83 cache: 3,711,483,904 bytes across
+# 34 mappings in 13 files. That is 91x the BootKC text, i.e. about
+# 10,600 core-seconds = 2.9 core-hours in ONE job. A 4-CPU runner would need
+# ~45 min of pure decode plus I/O, which is close enough to the useful limit
+# of a single job that a transient failure costs the whole sweep.
+#
+#   dsc_shards = 8, jobs-per-shard = 4   ->  32 workers, ~5.5 min of decode
+#                                            each in the ideal case; budget
+#                                            25-40 min per job with I/O and
+#                                            load imbalance.
+#   rootfs_shards = 12, jobs-per-shard = 4 -> the corpus size is not known
+#                                            until `prepare` runs discovery,
+#                                            so this is sized for the 299,960
+#                                            file / ~20k Mach-O case.
+#
+# max-parallel keeps the two matrices inside the 20-concurrent-job ceiling a
+# public repo gets: 4 + 6 = 10 at peak even when both run together.
+# Expected wall clock: prepare 45-60 min, matrices ~60 min, aggregate ~10 min.
+#
+# -----------------------------------------------------------------------------
+# INHERITED, ALREADY-PROVEN PRACTICE (all from extract_full_25G83.yml)
+# -----------------------------------------------------------------------------
+#   * ipsw pinned by input (3.1.739); "latest" warns loudly
+#   * apfs-fuse pinned to 66b86bd525e8cb90f9012543be89b1f092b75cf3
+#   * CMake 4.x needs -DCMAKE_POLICY_VERSION_MINIMUM=3.5 (run 41037554980)
+#   * g++ 15.2 needs -DCMAKE_CXX_FLAGS='-include cstdint' (run 41038815362)
+#   * the AEA key goes through aea_decrypt.sh: ::add-mask:: before anything is
+#     printed, empty key is a hard failure, diagnostics are sed-redacted (F6)
+#   * GitHub runs every block as `bash -e`; `set -uo pipefail` does NOT clear
+#     errexit, so a step meant to record gaps says `set +e` explicitly
+#     (run 41043160466)
+#   * PIPESTATUS is copied as a whole array, never element by element
+#     (run 41045152598)
+#   * every degraded branch appends to reports/missing_components.txt and the
+#     final step turns the run red on it, whatever else passed
+# =============================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: 'Where the containers come from: artifact (fast, donor run must not have expired) or ipsw (self-contained, ~30 min slower).'
+        required: true
+        type: choice
+        default: 'artifact'
+        options:
+          - artifact
+          - ipsw
+      donor_run_id:
+        description: 'Run whose artifacts to reuse when source=artifact. 41049216524 is the verified full extraction; vma2-rootfs-full / vma2-cryptex-sys expire 2026-11-29.'
+        required: true
+        default: '41049216524'
+      ipsw_url:
+        description: 'Apple IPSW URL, used only when source=ipsw. Must support HTTP Range.'
+        required: true
+        default: 'https://updates.cdn-apple.com/2026SummerFCS/fullrestores/140-75212/A2A24B94-1FC1-45A3-93F7-C51B02AF1F4D/UniversalMac_26.6.2_25G83_Restore.ipsw'
+      ipsw_version:
+        description: 'Pinned blacktop/ipsw release, no leading v. "latest" floats and is discouraged.'
+        required: true
+        default: '3.1.739'
+      apfs_fuse_ref:
+        description: 'sgan81/apfs-fuse commit. Only built when source=ipsw.'
+        required: true
+        default: '66b86bd525e8cb90f9012543be89b1f092b75cf3'
+      capstone_version:
+        description: 'Pinned capstone. Findings depend on the decoder, so this must match the version the local baseline was produced with (5.0.1).'
+        required: true
+        default: '5.0.1'
+      dsc_shards:
+        description: 'Matrix width for the dyld shared cache. 8 x 4 processes = 32 workers over 3.71 GB of executable mapping.'
+        required: true
+        default: '8'
+      rootfs_shards:
+        description: 'Matrix width for the root-volume Mach-O corpus.'
+        required: true
+        default: '12'
+      jobs_per_shard:
+        description: 'Processes inside each shard. The runner has 4 CPUs.'
+        required: true
+        default: '4'
+      task_bytes:
+        description: 'Target bytes per parallel task inside a dsc shard. Byte-balanced, because cache image sizes span four orders of magnitude.'
+        required: true
+        default: '25165824'
+      sweep_rootfs:
+        description: 'Sweep the root-volume Mach-O corpus. Turn off to iterate on the cache only.'
+        required: true
+        type: boolean
+        default: true
+      sweep_dsc:
+        description: 'Sweep the dyld shared cache.'
+        required: true
+        type: boolean
+        default: true
+      max_manifest_lines:
+        description: 'Cap per-shard coverage-manifest.jsonl / fixup-manifest.jsonl lines. 0 = unlimited; the BootKC manifest was 692,338 lines.'
+        required: true
+        default: '400000'
+
+permissions:
+  contents: read
+
+env:
+  PY: python3
+  REPORTS: reports
+  MISSING_FILE: reports/missing_components.txt
+
+jobs:
+  # ===========================================================================
+  # PREPARE: the only job that touches multi-GB containers. Produces two small
+  # corpora plus the authoritative file census, and emits the matrices.
+  # ===========================================================================
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      dsc_matrix: ${{ steps.plan.outputs.dsc_matrix }}
+      rootfs_matrix: ${{ steps.plan.outputs.rootfs_matrix }}
+      dsc_exec_bytes: ${{ steps.plan.outputs.dsc_exec_bytes }}
+      macho_count: ${{ steps.plan.outputs.macho_count }}
+      have_dsc: ${{ steps.plan.outputs.have_dsc }}
+      have_corpus: ${{ steps.plan.outputs.have_corpus }}
+    env:
+      SOURCE: ${{ inputs.source }}
+      DONOR: ${{ inputs.donor_run_id }}
+      IPSW_URL: ${{ inputs.ipsw_url }}
+      IPSW_VERSION: ${{ inputs.ipsw_version }}
+      APFS_FUSE_REF: ${{ inputs.apfs_fuse_ref }}
+      CAPSTONE_VERSION: ${{ inputs.capstone_version }}
+      WORK: /tmp/work
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate inputs
+        run: |
+          set -euo pipefail
+          # Inputs are read through env and never spliced into a shell line,
+          # but the ones that DO reach a command line are restricted hard.
+          case "$SOURCE" in artifact|ipsw) ;; *) echo "::error::bad source"; exit 1 ;; esac
+          if ! printf '%s' "$DONOR" | grep -qE '^[0-9]{6,20}$'; then
+            echo "::error title=Bad donor_run_id::expected a numeric run id"; exit 1
+          fi
+          if ! printf '%s' "$CAPSTONE_VERSION" | grep -qE '^[0-9]+\.[0-9]+(\.[0-9]+)?$'; then
+            echo "::error title=Bad capstone_version::expected N.N[.N]"; exit 1
+          fi
+          if ! printf '%s' "$IPSW_VERSION" | grep -qE '^([0-9]+\.[0-9]+\.[0-9]+|latest)$'; then
+            echo "::error title=Bad ipsw_version::expected N.N.N or latest"; exit 1
+          fi
+          for n in '${{ inputs.dsc_shards }}' '${{ inputs.rootfs_shards }}' \
+                   '${{ inputs.jobs_per_shard }}' '${{ inputs.task_bytes }}' \
+                   '${{ inputs.max_manifest_lines }}'; do
+            printf '%s' "$n" | grep -qE '^[0-9]+$' || { echo "::error::non-numeric input '$n'"; exit 1; }
+          done
+          case "$SOURCE" in
+            ipsw) case "$IPSW_URL" in https://*) ;; *) echo "::error::ipsw_url must be https"; exit 1 ;; esac ;;
+          esac
+          echo "source=$SOURCE donor=$DONOR capstone=$CAPSTONE_VERSION"
+
+      - name: Report starting disk budget
+        run: |
+          set -euo pipefail
+          echo "Budget assumption: ~86 GB free of a 145 GB root; this job peaks at 29.9 GiB of payload."
+          df -h /; nproc; free -h
+
+      - name: Install toolchain
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends zstd jq curl python3-pip
+          # Findings are a function of the decoder, so capstone is pinned to the
+          # version the local 81,453-finding control was measured with.
+          pip3 install --break-system-packages "capstone==${CAPSTONE_VERSION}" \
+            || pip3 install "capstone==${CAPSTONE_VERSION}"
+          python3 -c "import capstone; print('capstone core', capstone.cs_version())"
+          python3 -VV
+          mkdir -p "$REPORTS" "$WORK" out
+          : > "$MISSING_FILE"
+          {
+            echo "run      : ${{ github.run_id }} attempt ${{ github.run_attempt }}"
+            echo "sha      : ${{ github.sha }}"
+            echo "source   : $SOURCE (donor ${DONOR})"
+            echo "capstone : ${CAPSTONE_VERSION}"
+            echo "runner   : $(uname -srm), $(nproc) cpus"
+          } | tee "$REPORTS/run_environment.txt"
+          echo "--- scanner snapshot sha256 (which version of the tools ran) ---"
+          sha256sum tools/sweep_image.py tools/sweep_kernelcache.py \
+                    tools/armmac_baseline.py baseline/armmac-generic-v1-baseline.json \
+            | tee "$REPORTS/scanner_sha256.txt"
+
+      # ---------------------------------------------------------------------
+      # source = artifact
+      # ---------------------------------------------------------------------
+      - name: 'Containers from donor run artifacts'
+        if: ${{ inputs.source == 'artifact' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          set +e   # see run 41043160466: GitHub forces bash -e
+          mkdir -p "$WORK/dl"
+          OK_SYS=0; OK_ROOT=0
+          if [ "${{ inputs.sweep_dsc }}" = "true" ]; then
+            gh run download "$DONOR" -R "${{ github.repository }}" \
+               -n vma2-cryptex-sys -D "$WORK/dl/sys"
+            if [ -s "$WORK/dl/sys/vma2-cryptex-sys.tar.zst" ]; then OK_SYS=1; fi
+          else
+            OK_SYS=2
+          fi
+          if [ "${{ inputs.sweep_rootfs }}" = "true" ]; then
+            gh run download "$DONOR" -R "${{ github.repository }}" \
+               -n vma2-rootfs-full -D "$WORK/dl/root"
+            if [ -s "$WORK/dl/root/vma2-rootfs-full.tar.zst" ]; then OK_ROOT=1; fi
+          else
+            OK_ROOT=2
+          fi
+          if [ "$OK_SYS" = "0" ]; then
+            echo "::error title=Donor artifact gone::vma2-cryptex-sys is not available from run ${DONOR} (30-day retention, expiring 2026-11-29). Re-run this workflow with source=ipsw."
+            echo "SOURCE_ARTIFACT_MISSING vma2-cryptex-sys donor=${DONOR}" >> "$MISSING_FILE"
+          fi
+          if [ "$OK_ROOT" = "0" ]; then
+            echo "::error title=Donor artifact gone::vma2-rootfs-full is not available from run ${DONOR}. Re-run with source=ipsw."
+            echo "SOURCE_ARTIFACT_MISSING vma2-rootfs-full donor=${DONOR}" >> "$MISSING_FILE"
+          fi
+          # The .sha256 shipped next to each tar makes the artifact
+          # self-verifying without the reports artifact.
+          for d in "$WORK/dl/sys" "$WORK/dl/root"; do
+            [ -d "$d" ] || continue
+            ( cd "$d" && for s in *.sha256; do
+                [ -f "$s" ] || continue
+                sha256sum -c "$s" || echo "SHA256_MISMATCH $s" >> "${GITHUB_WORKSPACE}/${MISSING_FILE}"
+              done )
+          done
+          ls -lR "$WORK/dl" | head -n 40
+          df -h /
+          exit 0
+
+      # ---------------------------------------------------------------------
+      # source = ipsw  (self-contained; reuses the two verified helper scripts)
+      # ---------------------------------------------------------------------
+      - name: 'Containers from the IPSW: build apfs-fuse'
+        if: ${{ inputs.source == 'ipsw' }}
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake git pkg-config libfuse3-dev fuse3 \
+            zlib1g-dev libbz2-dev libattr1-dev libacl1-dev attr acl
+          printf '%s' "$APFS_FUSE_REF" | grep -qE '^[A-Za-z0-9._/-]+$' \
+            || { echo "::error::bad apfs_fuse_ref"; exit 1; }
+          git clone --recursive https://github.com/sgan81/apfs-fuse.git /tmp/apfs-fuse
+          git -C /tmp/apfs-fuse checkout --quiet --recurse-submodules "$APFS_FUSE_REF"
+          echo "APFS_FUSE_SHA=$(git -C /tmp/apfs-fuse rev-parse HEAD)" >> "$GITHUB_ENV"
+          cmake --version | head -n 1; g++ --version | head -n 1
+          # Two pieces of runner drift, both recorded in docs/cloud-extraction.md
+          # 8.4 and both fatal without these flags:
+          #   CMake 4.x removed cmake_minimum_required(< 3.5) support
+          #     -> run 41037554980 died in configure
+          #   g++ 15.2 no longer pulls <cstdint> in transitively and
+          #     ApfsLib/PList.h uses uint8_t without including it
+          #     -> run 41038815362 died at 76%
+          cmake -S /tmp/apfs-fuse -B /tmp/apfs-fuse/build \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+                -DCMAKE_CXX_FLAGS='-include cstdint'
+          cmake --build /tmp/apfs-fuse/build -j "$(nproc)"
+          sudo find /tmp/apfs-fuse/build -maxdepth 1 -type f -perm -u+x \
+               \( -name 'apfs-*' -o -name 'apfsutil' \) -exec cp {} /usr/local/bin/ \;
+          command -v apfs-fuse
+
+      - name: 'Containers from the IPSW: install pinned ipsw CLI'
+        if: ${{ inputs.source == 'ipsw' }}
+        run: |
+          set -euo pipefail
+          VER="$IPSW_VERSION"
+          if [ "$VER" = "latest" ]; then
+            VER=$(curl -fsSL https://api.github.com/repos/blacktop/ipsw/releases/latest | jq -r .tag_name | sed 's/^v//')
+            echo "::warning title=Unpinned ipsw::resolved latest to ${VER}"
+          fi
+          curl -fL --retry 3 -o /tmp/ipsw.deb \
+            "https://github.com/blacktop/ipsw/releases/download/v${VER}/ipsw_${VER}_linux_x86_64.deb"
+          sudo dpkg -i /tmp/ipsw.deb
+          ipsw version
+          echo "IPSW_RESOLVED_VERSION=$VER" >> "$GITHUB_ENV"
+
+      - name: 'Containers from the IPSW: fetch, decrypt, tar'
+        if: ${{ inputs.source == 'ipsw' }}
+        run: |
+          set -euo pipefail
+          chmod +x pack_full_volume.sh aea_decrypt.sh
+          mkdir -p "$WORK"/{aea,dec,mnt_sys,mnt_rootfs,dl/sys,dl/root}
+          export ZSTD_LEVEL=12 ZSTD_EXTRA=--long=27 VERIFY=1
+          export MISSING_FILE="${GITHUB_WORKSPACE}/${MISSING_FILE}"
+          # One container at a time, .aea deleted the moment it is decrypted
+          # and the container dropped after tar: the 23.5 GiB peak measured in
+          # extract_full_25G83.yml.
+          if [ "${{ inputs.sweep_dsc }}" = "true" ]; then
+            ipsw extract --remote "$IPSW_URL" --dmg sys -o "$WORK/aea"
+            AEA=$(find "$WORK/aea" -type f -name '*.dmg.aea' | head -n 1)
+            # aea_decrypt.sh masks the WKMS key before printing anything and
+            # hard-fails on an empty key (F6; the key from run 40319004513 is
+            # permanently public and that must never recur).
+            [ -n "$AEA" ] && ./aea_decrypt.sh "$AEA" "$WORK/dec" "$MISSING_FILE" \
+              || find "$WORK/aea" -name '*.dmg' -exec mv {} "$WORK/dec/" \;
+            DMG=$(find "$WORK/dec" -type f -name '*.dmg' | head -n 1)
+            ./pack_full_volume.sh "$DMG" "$WORK/mnt_sys" \
+               "$WORK/dl/sys/vma2-cryptex-sys.tar.zst" cryptex-sys \
+               "${GITHUB_WORKSPACE}/${REPORTS}"
+            rm -rf "$WORK/dec" "$WORK/aea"; mkdir -p "$WORK/dec" "$WORK/aea"
+            df -h /
+          fi
+          if [ "${{ inputs.sweep_rootfs }}" = "true" ]; then
+            ipsw extract --remote "$IPSW_URL" --dmg fs -o "$WORK/aea"
+            AEA=$(find "$WORK/aea" -type f -name '*.dmg.aea' | head -n 1)
+            [ -n "$AEA" ] && ./aea_decrypt.sh "$AEA" "$WORK/dec" "$MISSING_FILE" \
+              || find "$WORK/aea" -name '*.dmg' -exec mv {} "$WORK/dec/" \;
+            DMG=$(find "$WORK/dec" -type f -name '*.dmg' | head -n 1)
+            ./pack_full_volume.sh "$DMG" "$WORK/mnt_rootfs" \
+               "$WORK/dl/root/vma2-rootfs-full.tar.zst" rootfs \
+               "${GITHUB_WORKSPACE}/${REPORTS}"
+            rm -rf "$WORK/dec" "$WORK/aea"
+            df -h /
+          fi
+
+      # ---------------------------------------------------------------------
+      # Carve the arm64e cache group out of the cryptex tar
+      # ---------------------------------------------------------------------
+      - name: 'Carve the arm64e dyld shared cache group'
+        if: ${{ inputs.sweep_dsc }}
+        run: |
+          set -uo pipefail
+          set +e
+          TAR="$WORK/dl/sys/vma2-cryptex-sys.tar.zst"
+          if [ ! -s "$TAR" ]; then
+            echo "::error title=No cryptex tar::cannot carve the cache group"
+            echo "DSC_SOURCE_MISSING" >> "$MISSING_FILE"
+            exit 0
+          fi
+          mkdir -p "$WORK/dsc"
+          # Members are not seekable in a stream, so this is one pass over
+          # 18.16 GB of decompressed tar. Both arm64e groups are taken
+          # (System/Library and System/DriverKit); the x86_64 caches are
+          # deliberately NOT downloaded -- their sizes are recorded from the
+          # member list instead, so "we did not scan Rosetta" is a number.
+          zstd -dc --long=27 "$TAR" \
+            | tar -x -C "$WORK/dsc" --strip-components=1 --wildcards \
+                  './root/System/Library/dyld/dyld_shared_cache_arm64e*' \
+                  './root/System/DriverKit/System/Library/dyld/dyld_shared_cache_arm64e*' 2>"$REPORTS/dsc_tar_warnings.txt"
+          RCS=("${PIPESTATUS[@]}")           # whole array at once: run 41045152598
+          echo "zstd exit=${RCS[0]:-0} tar exit=${RCS[1]:-0}"
+          # And one cheap pass for the full member inventory, so the x86_64
+          # caches and the sidecars get counted without being fetched.
+          zstd -dc --long=27 "$TAR" | tar -tvf - 2>/dev/null \
+            | grep -E 'dyld_shared_cache' > "$REPORTS/dsc_inventory.txt"
+          cat "$REPORTS/dsc_inventory.txt"
+          find "$WORK/dsc" -type f -name 'dyld_shared_cache_arm64e*' \
+            -printf '%s\t%p\n' | sort -rn | tee "$REPORTS/dsc_group_sizes.txt"
+          N=$(find "$WORK/dsc" -type f -name 'dyld_shared_cache_arm64e*' | wc -l)
+          echo "arm64e cache files carved: $N"
+          if [ "$N" -lt 2 ]; then
+            echo "::error title=Cache group not carved::only $N arm64e file(s)"
+            echo "DSC_GROUP_INCOMPLETE n=${N}" >> "$MISSING_FILE"
+          fi
+          du -sh "$WORK/dsc"
+          rm -f "$TAR"
+          df -h /
+          mkdir -p out/dsc
+          tar -C "$WORK/dsc" -cf - . | zstd -T0 -9 -f -o out/dsc/dsc-arm64e.tar.zst
+          RCS=("${PIPESTATUS[@]}")
+          echo "repack: tar=${RCS[0]:-0} zstd=${RCS[1]:-0}"
+          ls -l out/dsc
+          ( cd out/dsc && sha256sum dsc-arm64e.tar.zst | tee dsc-arm64e.tar.zst.sha256 )
+          rm -rf "$WORK/dsc"
+          df -h /
+          exit 0
+
+      - name: Upload dsc-arm64e corpus
+        if: ${{ inputs.sweep_dsc }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: a11-dsc-arm64e-corpus
+          path: out/dsc/*
+          retention-days: 7
+          if-no-files-found: warn
+          compression-level: 0
+
+      # ---------------------------------------------------------------------
+      # Unpack the root volume, classify EVERY file, repack only the Mach-O
+      # ---------------------------------------------------------------------
+      - name: 'Root volume: unpack, census every file, carve the Mach-O corpus'
+        if: ${{ inputs.sweep_rootfs }}
+        run: |
+          set -uo pipefail
+          set +e
+          TAR="$WORK/dl/root/vma2-rootfs-full.tar.zst"
+          if [ ! -s "$TAR" ]; then
+            echo "::error title=No rootfs tar::cannot build the Mach-O corpus"
+            echo "ROOTFS_SOURCE_MISSING" >> "$MISSING_FILE"
+            exit 0
+          fi
+          mkdir -p "$WORK/rootfs" out/census
+          zstd -dc --long=27 "$TAR" | tar -x -C "$WORK/rootfs" \
+            2>"$REPORTS/rootfs_tar_warnings.txt"
+          RCS=("${PIPESTATUS[@]}")
+          echo "zstd exit=${RCS[0]:-0} tar exit=${RCS[1]:-0}  warnings=$(wc -l < "$REPORTS/rootfs_tar_warnings.txt")"
+          rm -f "$TAR"
+          df -h /
+          du -sh "$WORK/rootfs" || true
+
+          # THE file-level coverage statement, produced once and centrally so
+          # there is exactly one authoritative census of the 299,960 files.
+          # `discover` prunes nothing: scan_incompatible.py skipped Resources /
+          # Headers / Modules, which is how a closure quietly stops being one.
+          PYTHONPATH=tools python3 -u tools/sweep_image.py discover \
+            --target "$WORK/rootfs" --outdir out/census \
+            --baseline baseline/armmac-generic-v1-baseline.json
+          cp out/census/discovery.json "$REPORTS/rootfs_discovery.json" 2>/dev/null
+
+          # `discover` also emits a tar -T member list, so only the Mach-O go
+          # to the shards. The census already gave every other file a terminal
+          # state, so nothing is lost by not shipping it.
+          cp out/census/macho-members.txt /tmp/macho_members.txt
+          MACHO_N=$(wc -l < /tmp/macho_members.txt | tr -d ' ')
+          echo "mach-o members selected: $MACHO_N"
+          echo "MACHO_N=$MACHO_N" >> "$GITHUB_ENV"
+          if [ "$MACHO_N" -lt 100 ]; then
+            echo "::error title=Mach-O corpus implausibly small::$MACHO_N members"
+            echo "ROOTFS_MACHO_CORPUS_TOO_SMALL n=${MACHO_N}" >> "$MISSING_FILE"
+          fi
+          mkdir -p out/corpus
+          tar -C "$WORK/rootfs" --no-recursion -T /tmp/macho_members.txt -cf - \
+            2>"$REPORTS/corpus_tar_warnings.txt" \
+            | zstd -T0 -9 -f -o out/corpus/macho-corpus.tar.zst
+          RCS=("${PIPESTATUS[@]}")
+          echo "corpus: tar=${RCS[0]:-0} zstd=${RCS[1]:-0}"
+          cp /tmp/macho_members.txt out/corpus/macho_members.txt
+          ls -l out/corpus
+          ( cd out/corpus && sha256sum macho-corpus.tar.zst | tee macho-corpus.tar.zst.sha256 )
+          rm -rf "$WORK/rootfs"
+          df -h /
+          exit 0
+
+      - name: Upload macho corpus
+        if: ${{ inputs.sweep_rootfs }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: a11-macho-corpus
+          path: out/corpus/*
+          retention-days: 7
+          if-no-files-found: warn
+          compression-level: 0
+
+      - name: Upload file census
+        if: ${{ inputs.sweep_rootfs }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: a11-file-census
+          path: out/census/*
+          retention-days: 90
+          if-no-files-found: warn
+          compression-level: 9
+
+      - name: Plan the matrices
+        id: plan
+        run: |
+          set -euo pipefail
+          DS=${{ inputs.dsc_shards }}
+          RS=${{ inputs.rootfs_shards }}
+          DSC_M=$(python3 -c "import json,sys;print(json.dumps([{'shard':i,'of':$DS} for i in range($DS)]))")
+          ROOT_M=$(python3 -c "import json,sys;print(json.dumps([{'shard':i,'of':$RS} for i in range($RS)]))")
+          echo "dsc_matrix=$DSC_M"    >> "$GITHUB_OUTPUT"
+          echo "rootfs_matrix=$ROOT_M" >> "$GITHUB_OUTPUT"
+          echo "macho_count=${MACHO_N:-0}" >> "$GITHUB_OUTPUT"
+          HAVE_DSC=false; [ -s out/dsc/dsc-arm64e.tar.zst ] && HAVE_DSC=true
+          HAVE_CORP=false; [ -s out/corpus/macho-corpus.tar.zst ] && HAVE_CORP=true
+          echo "have_dsc=$HAVE_DSC"      >> "$GITHUB_OUTPUT"
+          echo "have_corpus=$HAVE_CORP"  >> "$GITHUB_OUTPUT"
+          echo "dsc_exec_bytes=3711483904" >> "$GITHUB_OUTPUT"
+          echo "planned: dsc=$DS shards (have=$HAVE_DSC), rootfs=$RS shards (have=$HAVE_CORP, ${MACHO_N:-0} Mach-O)"
+
+      - name: Upload prepare reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: a11-prepare-reports
+          path: reports/*
+          retention-days: 90
+          if-no-files-found: warn
+          compression-level: 9
+
+      - name: Fail prepare if anything degraded
+        if: always()
+        run: |
+          set -uo pipefail
+          [ -s "$MISSING_FILE" ] || { echo "missing_components empty."; exit 0; }
+          cat "$MISSING_FILE"
+          HARD='_MISSING|_FAILED|_INCOMPLETE|_TOO_SMALL|KEY_EMPTY|NO_OUTPUT|UNREADABLE|SHA256_MISMATCH|NOT_AEA_ENCRYPTED|NOT_APFS'
+          if grep -qE "$HARD" "$MISSING_FILE"; then
+            echo "::error title=Degraded prepare::reports/missing_components.txt has hard entries; the matrices would sweep an incomplete corpus."
+            exit 1
+          fi
+          echo "Only soft entries."
+
+  # ===========================================================================
+  # SWEEP the dyld shared cache, one shard per job
+  # ===========================================================================
+  sweep-dsc:
+    needs: prepare
+    if: ${{ inputs.sweep_dsc && needs.prepare.outputs.have_dsc == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        include: ${{ fromJson(needs.prepare.outputs.dsc_matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install capstone
+        run: |
+          set -euo pipefail
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends zstd
+          pip3 install --break-system-packages "capstone==${{ inputs.capstone_version }}" \
+            || pip3 install "capstone==${{ inputs.capstone_version }}"
+          python3 -c "import capstone;print('capstone',capstone.cs_version())"
+          df -h /
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: a11-dsc-arm64e-corpus
+          path: /tmp/dl
+
+      - name: Unpack the cache group
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/dsc
+          ( cd /tmp/dl && sha256sum -c dsc-arm64e.tar.zst.sha256 )
+          zstd -dc --long=27 /tmp/dl/dsc-arm64e.tar.zst | tar -x -C /tmp/dsc
+          rm -f /tmp/dl/dsc-arm64e.tar.zst
+          find /tmp/dsc -type f -printf '%s\t%p\n' | sort -rn | head -n 30
+          df -h /
+
+      - name: Sweep shard
+        run: |
+          set -euo pipefail
+          mkdir -p out reports
+          MAIN=$(find /tmp/dsc -type f -name 'dyld_shared_cache_arm64e' \
+                 -path '*System/Library/dyld*' | head -n 1)
+          [ -n "$MAIN" ] || MAIN=$(find /tmp/dsc -type f -name 'dyld_shared_cache_arm64e' | head -n 1)
+          echo "main cache: $MAIN"
+          # Exit 1 means a byte or a file reached a FAILING terminal state.
+          # That is information, not a crash, so it is captured and re-raised
+          # by the aggregate job after the shard report has been uploaded.
+          set +e
+          PYTHONPATH=tools python3 -u tools/sweep_image.py dsc \
+            --target "$MAIN" \
+            --outdir "out/dsc-${{ matrix.shard }}" \
+            --tag "dsc-arm64e-shard${{ matrix.shard }}of${{ matrix.of }}" \
+            --shard "${{ matrix.shard }}/${{ matrix.of }}" \
+            --jobs ${{ inputs.jobs_per_shard }} \
+            --task-bytes ${{ inputs.task_bytes }} \
+            --max-fixup-lines ${{ inputs.max_manifest_lines }} \
+            --baseline baseline/armmac-generic-v1-baseline.json \
+            2>&1 | tee "reports/sweep-dsc-${{ matrix.shard }}.log"
+          RCS=("${PIPESTATUS[@]}")
+          echo "${RCS[0]:-0}" > "out/dsc-${{ matrix.shard }}/exit_code.txt"
+          echo "sweeper exit: ${RCS[0]:-0}"
+          tail -n 40 "reports/sweep-dsc-${{ matrix.shard }}.log"
+          df -h /
+          exit 0
+
+      - name: Upload shard report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: a11-shard-dsc-${{ matrix.shard }}
+          path: |
+            out/dsc-${{ matrix.shard }}/*
+            reports/sweep-dsc-${{ matrix.shard }}.log
+          retention-days: 90
+          if-no-files-found: warn
+          compression-level: 9
+
+  # ===========================================================================
+  # SWEEP the root-volume Mach-O corpus, one shard per job
+  # ===========================================================================
+  sweep-rootfs:
+    needs: prepare
+    if: ${{ inputs.sweep_rootfs && needs.prepare.outputs.have_corpus == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        include: ${{ fromJson(needs.prepare.outputs.rootfs_matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install capstone
+        run: |
+          set -euo pipefail
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends zstd
+          pip3 install --break-system-packages "capstone==${{ inputs.capstone_version }}" \
+            || pip3 install "capstone==${{ inputs.capstone_version }}"
+          python3 -c "import capstone;print('capstone',capstone.cs_version())"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: a11-macho-corpus
+          path: /tmp/dl
+
+      - name: Unpack the corpus
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/corpus
+          ( cd /tmp/dl && sha256sum -c macho-corpus.tar.zst.sha256 )
+          zstd -dc /tmp/dl/macho-corpus.tar.zst | tar -x -C /tmp/corpus
+          rm -f /tmp/dl/macho-corpus.tar.zst
+          echo "corpus members: $(find /tmp/corpus -type f | wc -l)"
+          du -sh /tmp/corpus
+          df -h /
+
+      - name: Sweep shard
+        run: |
+          set -euo pipefail
+          mkdir -p out reports
+          set +e
+          PYTHONPATH=tools python3 -u tools/sweep_image.py tree \
+            --target /tmp/corpus \
+            --outdir "out/rootfs-${{ matrix.shard }}" \
+            --tag "rootfs-macho-shard${{ matrix.shard }}of${{ matrix.of }}" \
+            --shard "${{ matrix.shard }}/${{ matrix.of }}" \
+            --jobs ${{ inputs.jobs_per_shard }} \
+            --max-fixup-lines ${{ inputs.max_manifest_lines }} \
+            --baseline baseline/armmac-generic-v1-baseline.json \
+            2>&1 | tee "reports/sweep-rootfs-${{ matrix.shard }}.log"
+          RCS=("${PIPESTATUS[@]}")
+          echo "${RCS[0]:-0}" > "out/rootfs-${{ matrix.shard }}/exit_code.txt"
+          echo "sweeper exit: ${RCS[0]:-0}"
+          tail -n 40 "reports/sweep-rootfs-${{ matrix.shard }}.log"
+          df -h /
+          exit 0
+
+      - name: Upload shard report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: a11-shard-rootfs-${{ matrix.shard }}
+          path: |
+            out/rootfs-${{ matrix.shard }}/*
+            reports/sweep-rootfs-${{ matrix.shard }}.log
+          retention-days: 90
+          if-no-files-found: warn
+          compression-level: 9
+
+  # ===========================================================================
+  # AGGREGATE: merge every shard, prove the arithmetic, judge the run
+  # ===========================================================================
+  aggregate:
+    needs: [prepare, sweep-dsc, sweep-rootfs]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install capstone
+        run: |
+          set -euo pipefail
+          pip3 install --break-system-packages "capstone==${{ inputs.capstone_version }}" \
+            || pip3 install "capstone==${{ inputs.capstone_version }}"
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: a11-shard-*
+          path: /tmp/shards
+          merge-multiple: false
+
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: a11-file-census
+          path: /tmp/census
+
+      - name: Merge every shard
+        run: |
+          set -uo pipefail
+          set +e
+          mkdir -p "$REPORTS" out/merged out/merged-dsc out/merged-rootfs
+          : > "$MISSING_FILE"
+          find /tmp/shards -maxdepth 2 -name byte-coverage.json -printf '%h\n' \
+            | sort > /tmp/shard_dirs.txt
+          echo "shard dirs found: $(wc -l < /tmp/shard_dirs.txt)"
+          cat /tmp/shard_dirs.txt
+          if [ ! -s /tmp/shard_dirs.txt ]; then
+            echo "::error title=No shard reports::nothing to merge"
+            echo "AGGREGATE_NO_SHARDS" >> "$MISSING_FILE"
+            exit 0
+          fi
+          # Any shard whose sweeper exited non-zero reached a FAILING terminal
+          # state. Record it per shard; the final gate decides.
+          while IFS= read -r d; do
+            EC=$(cat "$d/exit_code.txt" 2>/dev/null || echo "?")
+            echo "$d exit=$EC" >> "$REPORTS/shard_exit_codes.txt"
+            [ "$EC" = "0" ] || echo "SHARD_FAILING_TERMINAL_STATE $(basename "$d") exit=${EC}" >> "$MISSING_FILE"
+          done < /tmp/shard_dirs.txt
+
+          mapfile -t ALL < /tmp/shard_dirs.txt
+          DSCD=(); ROOTD=()
+          for d in "${ALL[@]}"; do
+            case "$d" in *dsc*) DSCD+=("$d") ;; *rootfs*) ROOTD+=("$d") ;; esac
+          done
+          run_merge() {   # run_merge <outdir> <tag> <dirs...>
+            local o="$1" t="$2"; shift 2
+            [ "$#" -gt 0 ] || { echo "(no $t shards)"; return 0; }
+            PYTHONPATH=tools python3 -u tools/sweep_image.py merge \
+              --outdir "$o" --tag "$t" --inputs "$@" \
+              --baseline baseline/armmac-generic-v1-baseline.json
+          }
+          run_merge out/merged-dsc    25G83-vma2-dsc-arm64e        "${DSCD[@]}"
+          run_merge out/merged-rootfs 25G83-vma2-rootfs-macho      "${ROOTD[@]}"
+          run_merge out/merged        25G83-vma2-full-image        "${ALL[@]}"
+          [ -f /tmp/census/discovery.json ] && cp /tmp/census/discovery.json out/merged/
+          ls -lR out/merged | head -n 40
+          exit 0
+
+      - name: Coverage arithmetic and Step Summary
+        if: always()
+        run: |
+          set -uo pipefail
+          set +e
+          # The identity being checked: per-state byte counts must sum to the
+          # declared total exactly. Anything else means a byte was counted
+          # twice or not at all, and the percentage above it is meaningless.
+          # This is the whole difference between "it ran" and "it covered".
+          python3 -u tools/a11_coverage_check.py \
+            --scopes "dyld_shared_cache=out/merged-dsc" \
+                     "rootfs_macho=out/merged-rootfs" \
+                     "full_image=out/merged" \
+            --out "$REPORTS/coverage_rows.json" \
+            --missing "$MISSING_FILE" \
+            2>&1 | tee "$REPORTS/coverage_check.txt"
+          {
+            echo "## Full 25G83 vma2 image ARMv8.2-A sweep"
+            echo ""
+            echo "| field | value |"
+            echo "| :-- | :-- |"
+            echo "| source | \`${{ inputs.source }}\` (donor \`${{ inputs.donor_run_id }}\`) |"
+            echo "| capstone | \`${{ inputs.capstone_version }}\` |"
+            echo "| dsc shards | \`${{ inputs.dsc_shards }}\` x \`${{ inputs.jobs_per_shard }}\` proc |"
+            echo "| rootfs shards | \`${{ inputs.rootfs_shards }}\` x \`${{ inputs.jobs_per_shard }}\` proc |"
+            echo "| Mach-O in corpus | \`${{ needs.prepare.outputs.macho_count }}\` |"
+            echo ""
+            echo "### Coverage"
+            echo '```json'
+            cat "$REPORTS/coverage_check.txt" 2>/dev/null | head -n 80
+            echo '```'
+            echo ""
+            if [ -f out/merged/summary.json ]; then
+              echo "### Findings by category (full image)"
+              echo '```json'
+              python3 -c "import json;print(json.dumps(json.load(open('out/merged/summary.json'))['by_category'],indent=1))"
+              echo '```'
+              echo "### Findings by feature (full image)"
+              echo '```json'
+              python3 -c "import json;d=json.load(open('out/merged/summary.json'))['by_feature'];print(json.dumps(dict(list(d.items())[:30]),indent=1))"
+              echo '```'
+            fi
+            if [ -f out/merged/file-coverage.json ]; then
+              echo "### File terminal states"
+              echo '```json'
+              python3 -c "import json;d=json.load(open('out/merged/file-coverage.json'));print(json.dumps({'file_states':d['file_states'],'not_macho_reasons':dict(list(d['not_macho_reasons'].items())[:20]),'arch_slices':d['arch_slices_seen']},indent=1))"
+              echo '```'
+            fi
+            if [ -f out/merged/discovery.json ]; then
+              echo "### Root volume file census (all 299,960 files)"
+              echo '```json'
+              python3 -c "import json;d=json.load(open('out/merged/discovery.json'));print(json.dumps(d['provisional_states'],indent=1))"
+              echo '```'
+            fi
+            if [ -s "$MISSING_FILE" ]; then
+              echo "### :warning: missing_components"
+              echo '```'; cat "$MISSING_FILE"; echo '```'
+            else
+              echo "### missing_components: none"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+
+      - name: Upload merged report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: a11-merged-report
+          path: |
+            out/merged/*
+            out/merged-dsc/*
+            out/merged-rootfs/*
+            reports/*
+          retention-days: 90
+          if-no-files-found: warn
+          compression-level: 9
+
+      # Last step on purpose: everything is already uploaded, so failing here
+      # costs nothing. The point is that a sweep which quietly covered less
+      # than it claims can never finish green.
+      - name: Fail the run if coverage degraded
+        if: always()
+        run: |
+          set -uo pipefail
+          FAIL=0
+          if [ "${{ needs.prepare.result }}" != "success" ]; then
+            echo "::error title=prepare failed::no corpus was produced"; FAIL=1
+          fi
+          if [ -s "$MISSING_FILE" ]; then
+            echo "--- missing_components.txt ---"; cat "$MISSING_FILE"
+            HARD='_MISSING|_FAILED|_BROKEN|_NO_SHARDS|FAILING_TERMINAL_STATE|_INCOMPLETE'
+            grep -qE "$HARD" "$MISSING_FILE" && FAIL=1
+          fi
+          if [ ! -f out/merged/byte-coverage.json ]; then
+            echo "::error title=No merged coverage::aggregate produced nothing"; FAIL=1
+          fi
+          if [ "$FAIL" != "0" ]; then
+            echo "::error title=Degraded sweep::see the Step Summary. Artifacts are uploaded and usable, but the coverage claim is incomplete."
+            exit 1
+          fi
+          echo "Sweep complete and arithmetically closed."
