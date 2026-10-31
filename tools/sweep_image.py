@@ -793,12 +793,41 @@ class CacheSet:
         return self.images[i][1]
 
 
+def _parse_sections(c, nsects):
+    """section_64 records that follow a segment_command_64, as SK.Section.
+
+    They are already in the load-command bytes we read for the image header,
+    so this costs no extra I/O. They are the ONLY authoritative statement of
+    which bytes of an executable segment are instructions: __text and
+    __auth_stubs carry S_ATTR_PURE_INSTRUCTIONS, while __cstring,
+    __objc_methname, __const, __unwind_info and __gcc_except_tab carry
+    neither instruction attribute and are therefore data by Apple's own
+    declaration, not by any heuristic of ours.
+    """
+    out = []
+    so = 64
+    for _ in range(nsects):
+        raw = c[so:so + 80]
+        if len(raw) < 80:
+            break
+        sec = SK.Section()
+        sec.sectname = raw[:16].rstrip(b"\x00").decode("ascii", "replace")
+        sec.segname = raw[16:32].rstrip(b"\x00").decode("ascii", "replace")
+        sec.addr, sec.size, sec.offset, _align, _ro, _nr, sec.flags = \
+            struct.unpack("<QQIIIII", raw[32:68])
+        out.append(sec)
+        so += 80
+    return out
+
+
 def _dsc_image_metadata(cs, img_addr):
     """Read one in-cache image's exec segments, function starts and symbols.
 
     Returns (exec_segs, fn_starts, syms, source). `source` records how the
     function-start roots were obtained so the component row can say so; a
     failed resolution is reported, never papered over.
+
+    exec_segs rows are (name, vmaddr, vmsize, filesize, sections).
     """
     head = cs.read_va(img_addr, 32)
     if len(head) < 32:
@@ -822,12 +851,13 @@ def _dsc_image_metadata(cs, img_addr):
         c = cmds[idx + 8:idx + csz]
         if cmd == LC_SEGMENT_64 and len(c) >= 64:
             name = c[:16].rstrip(b"\x00").decode("ascii", "replace")
-            vmaddr, vmsize, fileoff, filesize, maxp, initp, _ns, _fl = \
+            vmaddr, vmsize, fileoff, filesize, maxp, initp, nsects, _fl = \
                 struct.unpack("<QQQQIIII", c[16:64])
             if name == "__LINKEDIT":
                 linkedit_va, linkedit_fileoff = vmaddr, fileoff
             if initp & VM_PROT_EXECUTE:
-                exec_segs.append((name, vmaddr, vmsize, filesize))
+                exec_segs.append((name, vmaddr, vmsize, filesize,
+                                  _parse_sections(c, nsects)))
         elif cmd == LC_FUNCTION_STARTS and len(c) >= 8:
             fs_off, fs_sz = struct.unpack("<II", c[:8])
         elif cmd == LC_SYMTAB and len(c) >= 16:
@@ -854,7 +884,8 @@ def _dsc_image_metadata(cs, img_addr):
         fn_starts.sort()
         inside = 0
         for fv in fn_starts:
-            for _n, va, _vs, fsz in exec_segs:
+            for row in exec_segs:
+                va, fsz = row[1], row[3]
                 if va <= fv < va + fsz:
                     inside += 1
                     break
@@ -1112,7 +1143,8 @@ def repair_function_starts(data, hoff, e, res=None):
     return "BL_TARGET_ROOTS"
 
 
-def _mk_segment(name, vmaddr, vmsize, fileoff, filesize, initprot, sections=None):
+def _mk_segment(name, vmaddr, vmsize, fileoff, filesize, initprot,
+                sections=None, default_code_region=False):
     s = SK.Segment()
     s.name = name
     s.vmaddr = vmaddr
@@ -1122,7 +1154,36 @@ def _mk_segment(name, vmaddr, vmsize, fileoff, filesize, initprot, sections=None
     s.maxprot = initprot
     s.initprot = initprot
     s.sections = sections or []
+    s.default_code_region = default_code_region
     return s
+
+
+def _clip_sections(exec_segs, lo, hi):
+    """Sections of an image's executable segments, clipped to [lo, hi).
+
+    [lo, hi) is this image's slice of the cache's executable mapping, which is
+    the byte universe (sweep_image's module docstring). Clipping rather than
+    extending keeps the denominator exactly where it was: a section is only
+    allowed to label bytes the mapping partition already handed to this image.
+    """
+    out = []
+    for row in exec_segs:
+        for sec in row[4] if len(row) > 4 else []:
+            if sec.size == 0:
+                continue
+            a = max(sec.addr, lo)
+            b = min(sec.addr + sec.size, hi)
+            if b <= a:
+                continue
+            c = SK.Section()
+            c.sectname = sec.sectname
+            c.segname = sec.segname
+            c.addr = a
+            c.size = b - a
+            c.offset = sec.offset + (a - sec.addr)
+            c.flags = sec.flags
+            out.append(c)
+    return out
 
 
 def sweep_macho_file(path, outdir, res, cfg, rel=None, want_fixups=True):
@@ -1415,9 +1476,26 @@ def sweep_dsc_task(cs, cache_path, mapping_index, img_lo, img_hi, outdir,
             e.func_starts = fn_starts
             e.syms = [s for s in syms if a <= s[0] < b]
             e.sym_addrs = [s[0] for s in e.syms]
-            e.segments = [_mk_segment(m and f"__TEXT(map{mapping_index})",
+            # Attach the image's OWN section headers, clipped to this range.
+            # Without them sweep_segment takes the "segment without section
+            # headers" branch and linearly decodes an image's __cstring,
+            # __objc_methname, __const, __unwind_info and __gcc_except_tab as
+            # if they were instructions - which is where the userland DSC
+            # scope's upper-bound-only category counts came from (a single
+            # mnemonic, fnmls, decoded 4,935,874 times out of constant data).
+            # This is not a new criterion: it is the same S_ATTR_*_INSTRUCTIONS
+            # test sweep_segment already applies to the BootKC, which is why
+            # that scope reaches 99.9996% while this one sat at 98.75%.
+            secs = (_clip_sections(exec_segs, a, a + nbytes)
+                    if cfg.get("dsc_sections", True) else [])
+            e.segments = [_mk_segment(f"__TEXT(map{mapping_index})",
                                       a, nbytes, foff + (a - lo), nbytes,
-                                      m["init_prot"])]
+                                      m["init_prot"], sections=secs,
+                                      default_code_region=True)]
+            if secs:
+                res["extra_bytes"]["dsc_images_with_section_headers"] += 1
+            elif label != "<cache-unclaimed>":
+                res["extra_bytes"]["dsc_images_without_section_headers"] += 1
 
             sweep = SK.Sweep(win, base_name, outdir, write_manifest=False)
             try:
@@ -1898,6 +1976,14 @@ def main(argv=None):
     ap.add_argument("--task-bytes", type=int, default=24 * 1024 * 1024,
                     help="dsc mode: target bytes per parallel task")
     ap.add_argument("--no-fixups", action="store_true")
+    ap.add_argument("--no-dsc-sections", action="store_true",
+                    help="dsc mode: do NOT read the per-image section headers. "
+                         "Reproduces the pre-2026-10-31 behaviour, in which an "
+                         "image's whole slice of an executable mapping was "
+                         "treated as an instruction region and its __cstring / "
+                         "__objc_methname / __const / __unwind_info were "
+                         "linearly decoded as code. Kept only so the before/"
+                         "after of that change can be re-derived on demand.")
     ap.add_argument("--max-fixup-lines", type=int, default=200000)
     ap.add_argument("--baseline", default=os.path.join(
         "analysis", "compat", "armmac-generic-v1-baseline.json"))
@@ -1923,10 +2009,12 @@ def main(argv=None):
     t0 = time.time()
     cfg = {"baseline": args.baseline, "fixups": not args.no_fixups,
            "max_fixup_lines": args.max_fixup_lines,
-           "max_bytes": args.max_bytes}
+           "max_bytes": args.max_bytes,
+           "dsc_sections": not args.no_dsc_sections}
     res = _new_result()
     meta = {"target": args.target, "mode": args.mode,
             "shard": f"{si}/{sn}", "jobs": jobs,
+            "dsc_section_evidence": not args.no_dsc_sections,
             "generated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
 
     # ---------------- discover ------------------------------------------
@@ -2072,9 +2160,20 @@ def main(argv=None):
             else:
                 wl = os.path.join(args.outdir, "worklist.jsonl")
                 counts, _b = discover_tree(args.target, wl, limit=args.limit)
-                res["file_states"].update(
-                    {k: v for k, v in counts.items()
-                     if not str(k).startswith("TODO_MACHO")})
+                # Every shard walks the WHOLE corpus to build the same work
+                # list, so only one of them may contribute the file-level
+                # states that come from the walk rather than from the sweep.
+                # Letting all N contribute multiplied `DIR` by the shard
+                # count in the merged file census (129,684 reported for a
+                # corpus with 10,807 directories, over 12 shards). The
+                # per-file swept states are unaffected either way, because a
+                # file belongs to exactly one shard.
+                if si == 0:
+                    res["file_states"].update(
+                        {k: v for k, v in counts.items()
+                         if not str(k).startswith("TODO_MACHO")})
+                else:
+                    res["extra_bytes"]["walk_states_suppressed_non_zero_shard"] += 1
                 with open(wl, encoding="utf-8") as f:
                     for line in f:
                         r = json.loads(line)

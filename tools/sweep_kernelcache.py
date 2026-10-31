@@ -482,8 +482,17 @@ class Section:
 
 
 class Segment:
+    # default_code_region decides what a byte INSIDE the segment but OUTSIDE
+    # every section header is. For a Mach-O parsed from its own load commands
+    # the section table tiles the segment, so a byte outside it is a gap:
+    # False, which is what pass E turns into DATA_SEGMENT_GAP. A synthetic
+    # segment (one dyld-cache image's slice of an executable mapping) is NOT
+    # tiled by the sections it carries - the inter-image padding belongs to no
+    # section at all - so there the honest default is "still a candidate for
+    # code": True, which leaves those bytes to the normal decode ladder
+    # instead of declaring them proven data on no evidence.
     __slots__ = ("name", "vmaddr", "vmsize", "fileoff", "filesize",
-                 "maxprot", "initprot", "sections")
+                 "maxprot", "initprot", "sections", "default_code_region")
 
     @property
     def is_exec(self):
@@ -524,6 +533,7 @@ def parse_macho(data, header_off, entry_id):
             (s.vmaddr, s.vmsize, s.fileoff, s.filesize,
              s.maxprot, s.initprot, nsects, _flags) = struct.unpack("<QQQQIIII", c[16:64])
             s.sections = []
+            s.default_code_region = False
             so = 64
             for _s in range(nsects):
                 raw = c[so:so + 80]
@@ -596,6 +606,7 @@ def parse_container(path):
             (s.vmaddr, s.vmsize, s.fileoff, s.filesize,
              s.maxprot, s.initprot, _nsects, _fl) = struct.unpack("<QQQQIIII", c[16:64])
             s.sections = []
+            s.default_code_region = False
             outer_segs.append(s)
         elif cmd == LC_FILESET_ENTRY:
             vmaddr, fileoff, eoff, _rsv = struct.unpack("<QQII", c[:24])
@@ -968,6 +979,18 @@ class Sweep:
 
         # --- section map ---------------------------------------------------
         if seg.sections:
+            untiled = getattr(seg, "default_code_region", False)
+            if untiled:
+                # A segment whose section table does NOT tile it (one
+                # dyld-cache image's slice of an executable mapping: see
+                # Segment.default_code_region) starts out all code region, so
+                # bytes outside every section keep going through the decode
+                # ladder instead of being handed DATA_SEGMENT_GAP by pass E on
+                # no evidence at all.
+                for i in range(nwords):
+                    is_code_region[i] = 1
+            covered = bytearray(nwords) if untiled else None
+            n_code_sect = n_data_sect = 0
             for sec in seg.sections:
                 if sec.size == 0:
                     continue
@@ -977,13 +1000,27 @@ class Sweep:
                 hi = min(nwords, hi)
                 if hi <= lo:
                     continue
+                if covered is not None:
+                    for i in range(lo, hi):
+                        covered[i] = 1
                 code = bool(sec.flags & (S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS))
                 if code:
+                    n_code_sect += 1
                     for i in range(lo, hi):
                         is_code_region[i] = 1
                 else:
+                    n_data_sect += 1
                     for i in range(lo, hi):
                         state[i] = ST_DATA_NONCODE_SECTION
+            if untiled:
+                # Audit trail for the one figure a reader will want to check:
+                # how much of this range Apple's own section headers claim at
+                # all, split code / not-code, and how much they leave over.
+                self.extra_bytes["untiled_bytes_outside_every_section"] += \
+                    (nwords - sum(covered)) * 4
+                self.extra_bytes["untiled_segments_with_sections"] += 1
+                self.extra_bytes["untiled_code_sections"] += n_code_sect
+                self.extra_bytes["untiled_noncode_sections"] += n_data_sect
         else:
             # segment without section headers: whole thing is an instruction region
             for i in range(nwords):

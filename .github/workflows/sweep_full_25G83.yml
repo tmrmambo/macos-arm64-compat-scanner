@@ -214,10 +214,33 @@ on:
         type: boolean
         default: true
       sweep_dsc:
-        description: 'Sweep the dyld shared cache.'
+        description: 'Sweep the MAIN System/Library/dyld arm64e shared cache (3.71 GB of executable mapping).'
         required: true
         type: boolean
         default: true
+      sweep_driverkit:
+        description: 'Sweep the System/DriverKit arm64e shared cache as its own scope. It is a separate cache group (58 images, 16.58 MB of executable mapping) and run 41163495630 swept it BY ACCIDENT instead of the main cache.'
+        required: true
+        type: boolean
+        default: true
+      sweep_cryptex:
+        description: 'Sweep the SystemOS cryptex outside the dyld caches (5.07 GB) and the whole AppOS cryptex (26 MB). Both are listed NOT SWEPT in INCOMPATIBILITY-MASTER-LIST 2.2.'
+        required: true
+        type: boolean
+        default: true
+      run_bitfield_census:
+        description: 'Run the decoder-free bit-field census next to the capstone sweep. This is the independent cross-check the master list grades A on, and the only thing that can show a decoder GAP rather than a decoder disagreement.'
+        required: true
+        type: boolean
+        default: true
+      census_shards:
+        description: 'Matrix width for the decoder-free census. It reads ~0.75 MB/s/core, so 3.71 GB wants several shards.'
+        required: true
+        default: '6'
+      cryptex_shards:
+        description: 'Matrix width for the cryptex Mach-O corpus.'
+        required: true
+        default: '6'
       max_manifest_lines:
         description: 'Cap per-shard coverage-manifest.jsonl / fixup-manifest.jsonl lines. 0 = unlimited; the BootKC manifest was 692,338 lines.'
         required: true
@@ -249,6 +272,10 @@ jobs:
       macho_count: ${{ steps.plan.outputs.macho_count }}
       have_dsc: ${{ steps.plan.outputs.have_dsc }}
       have_corpus: ${{ steps.plan.outputs.have_corpus }}
+      have_cryptex: ${{ steps.plan.outputs.have_cryptex }}
+      cryptex_matrix: ${{ steps.plan.outputs.cryptex_matrix }}
+      census_matrix: ${{ steps.plan.outputs.census_matrix }}
+      cryptex_macho_count: ${{ steps.plan.outputs.cryptex_macho_count }}
     env:
       SOURCE: ${{ inputs.source }}
       DONOR: ${{ inputs.donor_run_id }}
@@ -279,6 +306,7 @@ jobs:
           fi
           for n in '${{ inputs.dsc_shards }}' '${{ inputs.rootfs_shards }}' \
                    '${{ inputs.jobs_per_shard }}' '${{ inputs.task_bytes }}' \
+                   '${{ inputs.census_shards }}' '${{ inputs.cryptex_shards }}' \
                    '${{ inputs.max_manifest_lines }}'; do
             printf '%s' "$n" | grep -qE '^[0-9]+$' || { echo "::error::non-numeric input '$n'"; exit 1; }
           done
@@ -352,7 +380,20 @@ jobs:
           set +e   # see run 41043160466: GitHub forces bash -e
           mkdir -p "$WORK/dl"
           OK_SYS=0; OK_ROOT=0
-          if [ "${{ inputs.sweep_dsc }}" = "true" ]; then
+          if [ "${{ inputs.sweep_cryptex }}" = "true" ]; then
+            # The AppOS cryptex is 26 MB and is its own container; it is
+            # listed NOT SWEPT in the master list purely because nothing had
+            # ever fetched it.
+            gh run download "$DONOR" -R "${{ github.repository }}" \
+               -n vma2-cryptex-app -D "$WORK/dl/app"
+            if [ ! -s "$WORK/dl/app/vma2-cryptex-app.tar.zst" ]; then
+              echo "::error title=Donor artifact gone::vma2-cryptex-app is not available from run ${DONOR}."
+              echo "SOURCE_ARTIFACT_MISSING vma2-cryptex-app donor=${DONOR}" >> "$MISSING_FILE"
+            fi
+          fi
+          if [ "${{ inputs.sweep_dsc }}" = "true" ] \
+             || [ "${{ inputs.sweep_driverkit }}" = "true" ] \
+             || [ "${{ inputs.sweep_cryptex }}" = "true" ]; then
             gh run download "$DONOR" -R "${{ github.repository }}" \
                -n vma2-cryptex-sys -D "$WORK/dl/sys"
             if [ -s "$WORK/dl/sys/vma2-cryptex-sys.tar.zst" ]; then OK_SYS=1; fi
@@ -476,8 +517,8 @@ jobs:
       # ---------------------------------------------------------------------
       # Carve the arm64e cache group out of the cryptex tar
       # ---------------------------------------------------------------------
-      - name: 'Carve the arm64e dyld shared cache group'
-        if: ${{ inputs.sweep_dsc }}
+      - name: 'SystemOS cryptex: unpack once, census every file, carve both corpora'
+        if: ${{ inputs.sweep_dsc || inputs.sweep_driverkit || inputs.sweep_cryptex }}
         run: |
           set -uo pipefail
           set +e
@@ -487,46 +528,130 @@ jobs:
             echo "DSC_SOURCE_MISSING" >> "$MISSING_FILE"
             exit 0
           fi
-          mkdir -p "$WORK/dsc"
-          # Members are not seekable in a stream, so this is one pass over
-          # 18.16 GB of decompressed tar. Both arm64e groups are taken
-          # (System/Library and System/DriverKit); the x86_64 caches are
-          # deliberately NOT downloaded -- their sizes are recorded from the
-          # member list instead, so "we did not scan Rosetta" is a number.
-          zstd -dc --long=27 "$TAR" \
-            | tar -x -C "$WORK/dsc" --strip-components=1 --wildcards \
-                  './root/System/Library/dyld/dyld_shared_cache_arm64e*' \
-                  './root/System/DriverKit/System/Library/dyld/dyld_shared_cache_arm64e*' 2>"$REPORTS/dsc_tar_warnings.txt"
+          mkdir -p "$WORK/sys" "$WORK/dsc" out/dsc out/cryptex out/census-cryptex
+          # ONE full extraction, not three streamed passes. The previous
+          # version streamed the tar twice and only ever took the cache files
+          # out of it, which is why the other 5.07 GB of this container has
+          # never been swept (master list 2.2, cryptex_sys NOT SWEPT). 18.16 GB
+          # on a 145 GB root is affordable; the container is deleted straight
+          # after and the measured peak for the whole job was 78 GB.
+          zstd -dc --long=27 "$TAR" | tar -x -C "$WORK/sys" \
+            2>"$REPORTS/dsc_tar_warnings.txt"
           RCS=("${PIPESTATUS[@]}")           # whole array at once: run 41045152598
           echo "zstd exit=${RCS[0]:-0} tar exit=${RCS[1]:-0}"
-          # And one cheap pass for the full member inventory, so the x86_64
-          # caches and the sidecars get counted without being fetched.
-          zstd -dc --long=27 "$TAR" | tar -tvf - 2>/dev/null \
-            | grep -E 'dyld_shared_cache' > "$REPORTS/dsc_inventory.txt"
-          cat "$REPORTS/dsc_inventory.txt"
-          find "$WORK/dsc" -type f -name 'dyld_shared_cache_arm64e*' \
-            -printf '%s\t%p\n' | sort -rn | tee "$REPORTS/dsc_group_sizes.txt"
-          N=$(find "$WORK/dsc" -type f -name 'dyld_shared_cache_arm64e*' | wc -l)
-          echo "arm64e cache files carved: $N"
-          if [ "$N" -lt 2 ]; then
-            echo "::error title=Cache group not carved::only $N arm64e file(s)"
-            echo "DSC_GROUP_INCOMPLETE n=${N}" >> "$MISSING_FILE"
-          fi
-          du -sh "$WORK/dsc"
           rm -f "$TAR"
-          df -h /
-          mkdir -p out/dsc
-          tar -C "$WORK/dsc" -cf - . | zstd -T0 -9 -f -o out/dsc/dsc-arm64e.tar.zst
+          du -sh "$WORK/sys"; df -h /
+
+          # Full member inventory of the caches, so the x86_64 ones are
+          # counted rather than quietly absent.
+          find "$WORK/sys" -type f -name 'dyld_shared_cache*' -printf '%s\t%p\n' \
+            | sort -rn | tee "$REPORTS/dsc_inventory.txt"
+
+          # ---- the cache groups, each copied out as its OWN corpus --------
+          # Keeping them separate is the fix for the defect in run
+          # 41163495630: the sweep job picked its main cache with
+          #   find ... -name dyld_shared_cache_arm64e -path '*System/Library/dyld*'
+          # and System/DriverKit/System/Library/dyld MATCHES that glob, so all
+          # 8 dsc shards swept the 16.58 MB DriverKit cache while reporting
+          # themselves as the dyld_shared_cache scope. Two corpora cannot be
+          # confused by a glob.
+          MAIN_DIR=$(find "$WORK/sys" -type d -path '*System/Library/dyld' \
+                     -not -path '*DriverKit*' | head -n 1)
+          DK_DIR=$(find "$WORK/sys" -type d -path '*DriverKit*/dyld' | head -n 1)
+          echo "main cache dir     : ${MAIN_DIR:-<none>}"
+          echo "driverkit cache dir: ${DK_DIR:-<none>}"
+          if [ -z "$MAIN_DIR" ]; then
+            echo "::error title=Main cache dir not found::System/Library/dyld absent from the cryptex"
+            echo "DSC_MAIN_DIR_MISSING" >> "$MISSING_FILE"
+          fi
+          mkdir -p "$WORK/dsc/main" "$WORK/dsc/driverkit"
+          [ -n "$MAIN_DIR" ] && cp -a "$MAIN_DIR"/dyld_shared_cache_arm64e* "$WORK/dsc/main/" 2>/dev/null
+          [ -n "$DK_DIR" ] && cp -a "$DK_DIR"/dyld_shared_cache_arm64e* "$WORK/dsc/driverkit/" 2>/dev/null
+          find "$WORK/dsc" -type f -printf '%s\t%p\n' | sort -rn \
+            | tee "$REPORTS/dsc_group_sizes.txt"
+          NM=$(find "$WORK/dsc/main" -type f -name 'dyld_shared_cache_arm64e*' | wc -l)
+          ND=$(find "$WORK/dsc/driverkit" -type f -name 'dyld_shared_cache_arm64e*' | wc -l)
+          MB=$(du -sb "$WORK/dsc/main" | cut -f1)
+          echo "main group: $NM file(s), $MB bytes;  driverkit group: $ND file(s)"
+          echo "DSC_MAIN_FILES=$NM" >> "$GITHUB_ENV"
+          echo "DSC_DK_FILES=$ND" >> "$GITHUB_ENV"
+          if [ "$NM" -lt 10 ]; then
+            echo "::error title=Main cache group incomplete::$NM arm64e file(s); 25G83 ships 13 mapped files plus 2 sidecars"
+            echo "DSC_GROUP_INCOMPLETE main n=${NM}" >> "$MISSING_FILE"
+          fi
+          # Size gate. This is the check that would have caught run
+          # 41163495630 at the source: the main group is ~5.5 GB on disk, and
+          # anything under 1 GB means the wrong group was selected.
+          if [ "${MB:-0}" -lt 1000000000 ]; then
+            echo "::error title=Main cache group too small::${MB} bytes, expected ~5.5e9. The wrong cache group was selected."
+            echo "DSC_MAIN_GROUP_TOO_SMALL bytes=${MB}" >> "$MISSING_FILE"
+          fi
+
+          # ---- census EVERY cryptex file, then carve the non-cache Mach-O --
+          # The census is the file-level coverage statement for this
+          # container, produced before anything is deleted. `discover` prunes
+          # nothing, so the 7,575 members all get a terminal state.
+          PYTHONPATH=tools python3 -u tools/sweep_image.py discover \
+            --target "$WORK/sys" --outdir out/census-cryptex \
+            --baseline baseline/armmac-generic-v1-baseline.json
+          cp out/census-cryptex/discovery.json "$REPORTS/cryptex_discovery.json" 2>/dev/null
+          # The caches are swept as caches, in their own scope, so they must
+          # NOT also go into the tree corpus: that would be the double count
+          # the mapping-table design exists to prevent.
+          grep -v 'dyld_shared_cache' out/census-cryptex/macho-members.txt \
+            > /tmp/cryptex_members.txt
+          CN=$(wc -l < /tmp/cryptex_members.txt | tr -d ' ')
+          echo "cryptex non-cache Mach-O members: $CN"
+          echo "CRYPTEX_N=$CN" >> "$GITHUB_ENV"
+          tar -C "$WORK/sys" --no-recursion -T /tmp/cryptex_members.txt -cf - \
+            2>"$REPORTS/cryptex_tar_warnings.txt" \
+            | zstd -T0 -9 -f -o out/cryptex/cryptex-sys-macho.tar.zst
           RCS=("${PIPESTATUS[@]}")
-          echo "repack: tar=${RCS[0]:-0} zstd=${RCS[1]:-0}"
-          ls -l out/dsc
-          ( cd out/dsc && sha256sum dsc-arm64e.tar.zst | tee dsc-arm64e.tar.zst.sha256 )
+          echo "cryptex corpus: tar=${RCS[0]:-0} zstd=${RCS[1]:-0}"
+          cp /tmp/cryptex_members.txt out/cryptex/cryptex_sys_members.txt
+          rm -rf "$WORK/sys"
+          df -h /
+
+          # ---- AppOS cryptex: 26 MB, taken whole ---------------------------
+          APP="$WORK/dl/app/vma2-cryptex-app.tar.zst"
+          if [ -s "$APP" ]; then
+            mkdir -p "$WORK/app" out/census-app
+            zstd -dc --long=27 "$APP" | tar -x -C "$WORK/app" \
+              2>"$REPORTS/app_tar_warnings.txt"
+            PYTHONPATH=tools python3 -u tools/sweep_image.py discover \
+              --target "$WORK/app" --outdir out/census-app \
+              --baseline baseline/armmac-generic-v1-baseline.json
+            cp out/census-app/discovery.json "$REPORTS/app_discovery.json" 2>/dev/null
+            AN=$(wc -l < out/census-app/macho-members.txt | tr -d ' ')
+            echo "appos Mach-O members: $AN"
+            tar -C "$WORK/app" --no-recursion \
+                -T out/census-app/macho-members.txt -cf - \
+              | zstd -T0 -9 -f -o out/cryptex/cryptex-app-macho.tar.zst
+            cp out/census-app/macho-members.txt out/cryptex/cryptex_app_members.txt
+            rm -rf "$WORK/app" "$APP"
+          elif [ "${{ inputs.sweep_cryptex }}" = "true" ]; then
+            echo "::warning title=No AppOS cryptex::vma2-cryptex-app was not fetched"
+            echo "CRYPTEX_APP_SOURCE_MISSING" >> "$MISSING_FILE"
+          fi
+
+          # ---- repack the two cache corpora --------------------------------
+          for g in main driverkit; do
+            [ -n "$(ls -A "$WORK/dsc/$g" 2>/dev/null)" ] || continue
+            tar -C "$WORK/dsc/$g" -cf - . \
+              | zstd -T0 -9 -f -o "out/dsc/dsc-arm64e-${g}.tar.zst"
+            RCS=("${PIPESTATUS[@]}")
+            echo "repack $g: tar=${RCS[0]:-0} zstd=${RCS[1]:-0}"
+          done
+          ( cd out/dsc && for f in *.tar.zst; do
+              [ -f "$f" ] && sha256sum "$f" | tee "$f.sha256"
+            done )
+          ls -l out/dsc out/cryptex
           rm -rf "$WORK/dsc"
           df -h /
           exit 0
 
       - name: Upload dsc-arm64e corpus
-        if: ${{ inputs.sweep_dsc }}
+        if: ${{ inputs.sweep_dsc || inputs.sweep_driverkit }}
         uses: actions/upload-artifact@v4
         with:
           name: a11-dsc-arm64e-corpus
@@ -534,6 +659,28 @@ jobs:
           retention-days: 7
           if-no-files-found: warn
           compression-level: 0
+
+      - name: Upload cryptex Mach-O corpora
+        if: ${{ inputs.sweep_cryptex }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: a11-cryptex-corpus
+          path: out/cryptex/*
+          retention-days: 7
+          if-no-files-found: warn
+          compression-level: 0
+
+      - name: Upload cryptex file census
+        if: ${{ inputs.sweep_cryptex }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: a11-cryptex-census
+          path: |
+            out/census-cryptex/*
+            out/census-app/*
+          retention-days: 90
+          if-no-files-found: warn
+          compression-level: 9
 
       # ---------------------------------------------------------------------
       # Unpack the root volume, classify EVERY file, repack only the Mach-O
@@ -617,17 +764,24 @@ jobs:
           set -euo pipefail
           DS=${{ inputs.dsc_shards }}
           RS=${{ inputs.rootfs_shards }}
-          DSC_M=$(python3 -c "import json,sys;print(json.dumps([{'shard':i,'of':$DS} for i in range($DS)]))")
-          ROOT_M=$(python3 -c "import json,sys;print(json.dumps([{'shard':i,'of':$RS} for i in range($RS)]))")
-          echo "dsc_matrix=$DSC_M"    >> "$GITHUB_OUTPUT"
-          echo "rootfs_matrix=$ROOT_M" >> "$GITHUB_OUTPUT"
+          CS=${{ inputs.census_shards }}
+          XS=${{ inputs.cryptex_shards }}
+          mk() { python3 -c "import json;print(json.dumps([{'shard':i,'of':$1} for i in range($1)]))"; }
+          echo "dsc_matrix=$(mk $DS)"      >> "$GITHUB_OUTPUT"
+          echo "rootfs_matrix=$(mk $RS)"   >> "$GITHUB_OUTPUT"
+          echo "census_matrix=$(mk $CS)"   >> "$GITHUB_OUTPUT"
+          echo "cryptex_matrix=$(mk $XS)"  >> "$GITHUB_OUTPUT"
           echo "macho_count=${MACHO_N:-0}" >> "$GITHUB_OUTPUT"
-          HAVE_DSC=false; [ -s out/dsc/dsc-arm64e.tar.zst ] && HAVE_DSC=true
+          echo "cryptex_macho_count=${CRYPTEX_N:-0}" >> "$GITHUB_OUTPUT"
+          HAVE_DSC=false; [ -s out/dsc/dsc-arm64e-main.tar.zst ] && HAVE_DSC=true
           HAVE_CORP=false; [ -s out/corpus/macho-corpus.tar.zst ] && HAVE_CORP=true
+          HAVE_CRY=false; [ -s out/cryptex/cryptex-sys-macho.tar.zst ] && HAVE_CRY=true
           echo "have_dsc=$HAVE_DSC"      >> "$GITHUB_OUTPUT"
           echo "have_corpus=$HAVE_CORP"  >> "$GITHUB_OUTPUT"
+          echo "have_cryptex=$HAVE_CRY"  >> "$GITHUB_OUTPUT"
           echo "dsc_exec_bytes=3711483904" >> "$GITHUB_OUTPUT"
-          echo "planned: dsc=$DS shards (have=$HAVE_DSC), rootfs=$RS shards (have=$HAVE_CORP, ${MACHO_N:-0} Mach-O)"
+          echo "planned: dsc=$DS (have=$HAVE_DSC), rootfs=$RS (have=$HAVE_CORP, ${MACHO_N:-0} Mach-O),"
+          echo "         census=$CS, cryptex=$XS (have=$HAVE_CRY, ${CRYPTEX_N:-0} Mach-O)"
 
       - name: Upload prepare reports
         if: always()
@@ -681,13 +835,13 @@ jobs:
           name: a11-dsc-arm64e-corpus
           path: /tmp/dl
 
-      - name: Unpack the cache group
+      - name: Unpack the main cache group
         run: |
           set -euo pipefail
           mkdir -p /tmp/dsc
-          ( cd /tmp/dl && sha256sum -c dsc-arm64e.tar.zst.sha256 )
-          zstd -dc --long=27 /tmp/dl/dsc-arm64e.tar.zst | tar -x -C /tmp/dsc
-          rm -f /tmp/dl/dsc-arm64e.tar.zst
+          ( cd /tmp/dl && sha256sum -c dsc-arm64e-main.tar.zst.sha256 )
+          zstd -dc --long=27 /tmp/dl/dsc-arm64e-main.tar.zst | tar -x -C /tmp/dsc
+          rm -f /tmp/dl/*.tar.zst
           find /tmp/dsc -type f -printf '%s\t%p\n' | sort -rn | head -n 30
           df -h /
 
@@ -695,10 +849,21 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p out reports
-          MAIN=$(find /tmp/dsc -type f -name 'dyld_shared_cache_arm64e' \
-                 -path '*System/Library/dyld*' | head -n 1)
-          [ -n "$MAIN" ] || MAIN=$(find /tmp/dsc -type f -name 'dyld_shared_cache_arm64e' | head -n 1)
+          # The corpus now contains ONLY the main group, so this find cannot
+          # pick up the DriverKit cache the way the previous
+          #   -path '*System/Library/dyld*'
+          # glob did - System/DriverKit/System/Library/dyld matched it, and all
+          # 8 shards of run 41163495630 swept 16.58 MB of DriverKit while
+          # labelling the result the dyld_shared_cache scope.
+          MAIN=$(find /tmp/dsc -type f -name 'dyld_shared_cache_arm64e' | head -n 1)
+          [ -n "$MAIN" ] || { echo "::error::no main cache in the corpus"; exit 1; }
           echo "main cache: $MAIN"
+          # Belt and braces: assert the group is the big one before spending
+          # an hour on it. 13 mapped files, ~5.5 GB on disk, 3.71 GB of
+          # executable mapping.
+          GB=$(du -sb /tmp/dsc | cut -f1)
+          echo "cache group on disk: $GB bytes"
+          [ "$GB" -ge 1000000000 ] || { echo "::error title=Wrong cache group::${GB} bytes"; exit 1; }
           # Exit 1 means a byte or a file reached a FAILING terminal state.
           # That is information, not a crash, so it is captured and re-raised
           # by the aggregate job after the shard report has been uploaded.
@@ -731,6 +896,255 @@ jobs:
           retention-days: 90
           if-no-files-found: warn
           compression-level: 9
+
+  # ===========================================================================
+  # SWEEP the DriverKit shared cache. Its own scope, deliberately this time.
+  # 58 images and 16.58 MB of executable mapping, so one job is plenty - but
+  # it has to be ONE JOB SEPARATE FROM THE MAIN CACHE, because run
+  # 41163495630 proved the two get confused when they share a selection glob.
+  # ===========================================================================
+  sweep-driverkit:
+    needs: prepare
+    if: ${{ inputs.sweep_driverkit }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install capstone
+        run: |
+          set -euo pipefail
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends zstd
+          pip3 install --break-system-packages "capstone==${{ inputs.capstone_version }}" \
+            || pip3 install "capstone==${{ inputs.capstone_version }}"
+          python3 -c "import capstone;print('capstone',capstone.cs_version())"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: a11-dsc-arm64e-corpus
+          path: /tmp/dl
+
+      - name: Sweep the DriverKit cache
+        run: |
+          set -uo pipefail
+          set +e
+          mkdir -p /tmp/dk out reports
+          if [ ! -s /tmp/dl/dsc-arm64e-driverkit.tar.zst ]; then
+            echo "::error title=No DriverKit corpus::prepare produced none"
+            echo "0" > /tmp/ec; mkdir -p out/driverkit
+            echo "1" > out/driverkit/exit_code.txt
+            exit 0
+          fi
+          ( cd /tmp/dl && sha256sum -c dsc-arm64e-driverkit.tar.zst.sha256 )
+          zstd -dc --long=27 /tmp/dl/dsc-arm64e-driverkit.tar.zst | tar -x -C /tmp/dk
+          find /tmp/dk -type f -printf '%s\t%p\n' | sort -rn
+          MAIN=$(find /tmp/dk -type f -name 'dyld_shared_cache_arm64e' | head -n 1)
+          [ -n "$MAIN" ] || { echo "::error::no DriverKit cache file"; exit 0; }
+          PYTHONPATH=tools python3 -u tools/sweep_image.py dsc \
+            --target "$MAIN" --outdir out/driverkit \
+            --tag "driverkit-dsc-arm64e" --shard 0/1 \
+            --jobs ${{ inputs.jobs_per_shard }} \
+            --task-bytes ${{ inputs.task_bytes }} \
+            --max-fixup-lines ${{ inputs.max_manifest_lines }} \
+            --baseline baseline/armmac-generic-v1-baseline.json \
+            2>&1 | tee reports/sweep-driverkit.log
+          RCS=("${PIPESTATUS[@]}")
+          echo "${RCS[0]:-0}" > out/driverkit/exit_code.txt
+          tail -n 40 reports/sweep-driverkit.log
+          exit 0
+
+      - name: Upload shard report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: a11-shard-driverkit-0
+          path: |
+            out/driverkit/*
+            reports/sweep-driverkit.log
+          retention-days: 90
+          if-no-files-found: warn
+          compression-level: 9
+
+  # ===========================================================================
+  # SWEEP the cryptex Mach-O outside the caches: SystemOS 5.07 GB + AppOS 26 MB
+  # ===========================================================================
+  sweep-cryptex:
+    needs: prepare
+    if: ${{ inputs.sweep_cryptex && needs.prepare.outputs.have_cryptex == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        include: ${{ fromJson(needs.prepare.outputs.cryptex_matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install capstone
+        run: |
+          set -euo pipefail
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends zstd
+          pip3 install --break-system-packages "capstone==${{ inputs.capstone_version }}" \
+            || pip3 install "capstone==${{ inputs.capstone_version }}"
+          python3 -c "import capstone;print('capstone',capstone.cs_version())"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: a11-cryptex-corpus
+          path: /tmp/dl
+
+      - name: Unpack both cryptex corpora into one tree
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/cryptex/sys /tmp/cryptex/app
+          ( cd /tmp/dl && for s in *.sha256; do sha256sum -c "$s"; done )
+          zstd -dc /tmp/dl/cryptex-sys-macho.tar.zst | tar -x -C /tmp/cryptex/sys
+          if [ -s /tmp/dl/cryptex-app-macho.tar.zst ]; then
+            zstd -dc /tmp/dl/cryptex-app-macho.tar.zst | tar -x -C /tmp/cryptex/app
+          fi
+          rm -f /tmp/dl/*.tar.zst
+          echo "corpus members: $(find /tmp/cryptex -type f | wc -l)"
+          du -sh /tmp/cryptex; df -h /
+
+      - name: Sweep shard
+        run: |
+          set -euo pipefail
+          mkdir -p out reports
+          set +e
+          PYTHONPATH=tools python3 -u tools/sweep_image.py tree \
+            --target /tmp/cryptex \
+            --outdir "out/cryptex-${{ matrix.shard }}" \
+            --tag "cryptex-macho-shard${{ matrix.shard }}of${{ matrix.of }}" \
+            --shard "${{ matrix.shard }}/${{ matrix.of }}" \
+            --jobs ${{ inputs.jobs_per_shard }} \
+            --max-fixup-lines ${{ inputs.max_manifest_lines }} \
+            --baseline baseline/armmac-generic-v1-baseline.json \
+            2>&1 | tee "reports/sweep-cryptex-${{ matrix.shard }}.log"
+          RCS=("${PIPESTATUS[@]}")
+          echo "${RCS[0]:-0}" > "out/cryptex-${{ matrix.shard }}/exit_code.txt"
+          tail -n 40 "reports/sweep-cryptex-${{ matrix.shard }}.log"
+          df -h /
+          exit 0
+
+      - name: Upload shard report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: a11-shard-cryptex-${{ matrix.shard }}
+          path: |
+            out/cryptex-${{ matrix.shard }}/*
+            reports/sweep-cryptex-${{ matrix.shard }}.log
+          retention-days: 90
+          if-no-files-found: warn
+          compression-level: 9
+
+  # ===========================================================================
+  # DECODER-FREE CENSUS of the main cache. No capstone, no state machine: bit
+  # fields only, bucketed by what Apple's own section headers say about the
+  # byte. This is the independent leg the master list's grade A requires, and
+  # the only measurement that can distinguish "category is absent" from "the
+  # decoder cannot see it".
+  # ===========================================================================
+  census-dsc:
+    needs: prepare
+    if: ${{ inputs.run_bitfield_census && needs.prepare.outputs.have_dsc == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        include: ${{ fromJson(needs.prepare.outputs.census_matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install zstd only
+        run: |
+          set -euo pipefail
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends zstd
+          # Deliberately NO capstone here. If this job could import a
+          # disassembler, "decoder-free" would be a claim about intent rather
+          # than about the environment.
+          python3 -c "
+          import importlib.util as u, sys
+          assert u.find_spec('capstone') is None, 'capstone present: the census would not be decoder-free'
+          print('no disassembler available to this job')"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: a11-dsc-arm64e-corpus
+          path: /tmp/dl
+
+      - name: Unpack the main cache group
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/dsc
+          ( cd /tmp/dl && sha256sum -c dsc-arm64e-main.tar.zst.sha256 )
+          zstd -dc --long=27 /tmp/dl/dsc-arm64e-main.tar.zst | tar -x -C /tmp/dsc
+          rm -f /tmp/dl/*.tar.zst
+          df -h /
+
+      - name: Census shard
+        run: |
+          set -euo pipefail
+          mkdir -p out reports
+          MAIN=$(find /tmp/dsc -type f -name 'dyld_shared_cache_arm64e' | head -n 1)
+          [ -n "$MAIN" ] || { echo "::error::no main cache"; exit 1; }
+          python3 -u tools/bitfield_census.py dsc \
+            --target "$MAIN" \
+            --out "out/census-dsc-${{ matrix.shard }}.json" \
+            --tag "dsc-arm64e" \
+            --shard "${{ matrix.shard }}/${{ matrix.of }}" \
+            2>&1 | tee "reports/census-dsc-${{ matrix.shard }}.log"
+          tail -n 30 "reports/census-dsc-${{ matrix.shard }}.log"
+
+      - name: Upload census shard
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: a11-census-dsc-${{ matrix.shard }}
+          path: |
+            out/census-dsc-${{ matrix.shard }}.json
+            reports/census-dsc-${{ matrix.shard }}.log
+          retention-days: 90
+          if-no-files-found: warn
+          compression-level: 9
+
+  # ===========================================================================
+  # VERIFY the census predicates against llvm-mc. A decoder-free census is
+  # only worth its arithmetic if its bit fields are right, and "right" has to
+  # come from a reference assembler rather than from the author.
+  # ===========================================================================
+  verify-census-masks:
+    if: ${{ inputs.run_bitfield_census }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install llvm-mc
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends llvm
+          MC=$(command -v llvm-mc || ls /usr/lib/llvm-*/bin/llvm-mc 2>/dev/null | head -n 1)
+          [ -n "$MC" ] || { echo "::error::llvm-mc not found"; exit 1; }
+          echo "MC=$MC" >> "$GITHUB_ENV"
+          "$MC" --version | head -n 3
+
+      - name: Assemble a witness for every predicate
+        run: |
+          set -euo pipefail
+          mkdir -p reports analysis/compat
+          python3 -u tools/testdata/verify_bitfield_masks.py --mc "$MC" \
+            --json reports/bitfield-mask-verification.json \
+            2>&1 | tee reports/bitfield-mask-verification.log
+
+      - name: Upload verification
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: a11-census-mask-verification
+          path: reports/*
+          retention-days: 90
+          if-no-files-found: warn
 
   # ===========================================================================
   # SWEEP the root-volume Mach-O corpus, one shard per job
@@ -808,7 +1222,8 @@ jobs:
   # AGGREGATE: merge every shard, prove the arithmetic, judge the run
   # ===========================================================================
   aggregate:
-    needs: [prepare, sweep-dsc, sweep-rootfs]
+    needs: [prepare, sweep-dsc, sweep-driverkit, sweep-cryptex, sweep-rootfs,
+            census-dsc, verify-census-masks]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 120
@@ -829,8 +1244,21 @@ jobs:
       - uses: actions/download-artifact@v4
         continue-on-error: true
         with:
+          pattern: a11-census-*
+          path: /tmp/census-shards
+          merge-multiple: false
+
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
           name: a11-file-census
           path: /tmp/census
+
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: a11-cryptex-census
+          path: /tmp/census-cryptex
 
       - name: Merge every shard
         run: |
@@ -866,10 +1294,22 @@ jobs:
           done < /tmp/shard_dirs.txt
 
           mapfile -t ALL < /tmp/shard_dirs.txt
-          DSCD=(); ROOTD=()
+          # Scope buckets. `driverkit` is tested BEFORE `dsc` because the
+          # DriverKit shard dir name contains neither - but the ordering is
+          # kept explicit anyway, since conflating those two scopes is the
+          # exact defect this run exists to correct.
+          DSCD=(); ROOTD=(); DKD=(); CRYD=()
           for d in "${ALL[@]}"; do
-            case "$d" in *dsc*) DSCD+=("$d") ;; *rootfs*) ROOTD+=("$d") ;; esac
+            case "$d" in
+              *driverkit*) DKD+=("$d") ;;
+              *cryptex*)   CRYD+=("$d") ;;
+              *dsc*)       DSCD+=("$d") ;;
+              *rootfs*)    ROOTD+=("$d") ;;
+              *) echo "::warning title=Unclassified shard::$d is in no scope" ;;
+            esac
           done
+          echo "scopes: dsc=${#DSCD[@]} rootfs=${#ROOTD[@]} driverkit=${#DKD[@]} cryptex=${#CRYD[@]}"
+          mkdir -p out/merged-driverkit out/merged-cryptex
           run_merge() {   # run_merge <outdir> <tag> <dirs...>
             local o="$1" t="$2"; shift 2
             [ "$#" -gt 0 ] || { echo "(no $t shards)"; return 0; }
@@ -877,10 +1317,48 @@ jobs:
               --outdir "$o" --tag "$t" --inputs "$@" \
               --baseline baseline/armmac-generic-v1-baseline.json
           }
-          run_merge out/merged-dsc    25G83-vma2-dsc-arm64e        "${DSCD[@]}"
-          run_merge out/merged-rootfs 25G83-vma2-rootfs-macho      "${ROOTD[@]}"
-          run_merge out/merged        25G83-vma2-full-image        "${ALL[@]}"
+          run_merge out/merged-dsc       25G83-vma2-dsc-arm64e      "${DSCD[@]}"
+          run_merge out/merged-rootfs    25G83-vma2-rootfs-macho    "${ROOTD[@]}"
+          run_merge out/merged-driverkit 25G83-vma2-driverkit-dsc   "${DKD[@]}"
+          run_merge out/merged-cryptex   25G83-vma2-cryptex-macho   "${CRYD[@]}"
+          run_merge out/merged           25G83-vma2-full-image      "${ALL[@]}"
           [ -f /tmp/census/discovery.json ] && cp /tmp/census/discovery.json out/merged/
+          [ -d /tmp/census-cryptex ] && cp -r /tmp/census-cryptex out/ 2>/dev/null
+
+          # ---- decoder-free census merge ----------------------------------
+          # Its own identity check: the shards must tile the container's
+          # executable mappings exactly, or no category total below it means
+          # anything. tools/bitfield_census.py merge exits 1 if they do not.
+          mkdir -p out/merged-census
+          find /tmp/census-shards -name 'census-dsc-*.json' | sort > /tmp/census_files.txt
+          echo "census shards found: $(wc -l < /tmp/census_files.txt)"
+          if [ -s /tmp/census_files.txt ]; then
+            mapfile -t CF < /tmp/census_files.txt
+            python3 -u tools/bitfield_census.py merge \
+              --inputs "${CF[@]}" \
+              --out out/merged-census/bitfield-census-dsc.json \
+              --tag 25G83-vma2-dsc-arm64e \
+              2>&1 | tee "$REPORTS/bitfield_census_merge.txt"
+            CEC=${PIPESTATUS[0]:-0}
+            echo "census merge exit: $CEC"
+            [ "$CEC" = "0" ] || echo "CENSUS_SHARDS_DO_NOT_TILE exit=${CEC}" >> "$MISSING_FILE"
+          else
+            echo "::warning title=No census shards::the independent cross-check did not run"
+            echo "CENSUS_NO_SHARDS" >> "$MISSING_FILE"
+          fi
+
+          # ---- decoder agreement: the actual grade-A statement -------------
+          # Side by side, per category: what the decoder found, and what a
+          # predicate that cannot miss anything found. Disagreement in either
+          # direction is the finding.
+          if [ -f out/merged-census/bitfield-census-dsc.json ] \
+             && [ -f out/merged-dsc/summary.json ]; then
+            python3 -u tools/census_vs_sweep.py \
+              --census out/merged-census/bitfield-census-dsc.json \
+              --sweep out/merged-dsc \
+              --out "$REPORTS/decoder_agreement.json" \
+              2>&1 | tee "$REPORTS/decoder_agreement.txt"
+          fi
           ls -lR out/merged | head -n 40
           exit 0
 
@@ -895,6 +1373,8 @@ jobs:
           # This is the whole difference between "it ran" and "it covered".
           python3 -u tools/a11_coverage_check.py \
             --scopes "dyld_shared_cache=out/merged-dsc" \
+                     "driverkit_dsc=out/merged-driverkit" \
+                     "cryptex_macho=out/merged-cryptex" \
                      "rootfs_macho=out/merged-rootfs" \
                      "full_image=out/merged" \
             --out "$REPORTS/coverage_rows.json" \
