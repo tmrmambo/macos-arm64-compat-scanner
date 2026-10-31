@@ -642,9 +642,17 @@ jobs:
             RCS=("${PIPESTATUS[@]}")
             echo "repack $g: tar=${RCS[0]:-0} zstd=${RCS[1]:-0}"
           done
-          ( cd out/dsc && for f in *.tar.zst; do
-              [ -f "$f" ] && sha256sum "$f" | tee "$f.sha256"
-            done )
+          # Every corpus gets its own sidecar digest, so each consumer can
+          # verify what it downloaded without the reports artifact. Missing
+          # these for out/cryptex is what killed all 6 sweep-cryptex shards
+          # of run 41185387531: their verify loop globbed *.sha256, found
+          # nothing, and `sha256sum -c '*.sha256'` under `bash -e` is fatal.
+          for d in out/dsc out/cryptex; do
+            [ -d "$d" ] || continue
+            ( cd "$d" && for f in *.tar.zst; do
+                [ -f "$f" ] && sha256sum "$f" | tee "$f.sha256"
+              done )
+          done
           ls -l out/dsc out/cryptex
           rm -rf "$WORK/dsc"
           df -h /
@@ -996,7 +1004,14 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p /tmp/cryptex/sys /tmp/cryptex/app
-          ( cd /tmp/dl && for s in *.sha256; do sha256sum -c "$s"; done )
+          # Verify every digest that IS there, and say so when there is none,
+          # rather than letting an unexpanded glob kill the job.
+          NS=$(ls -1 /tmp/dl/*.sha256 2>/dev/null | wc -l)
+          if [ "$NS" -gt 0 ]; then
+            ( cd /tmp/dl && for s in *.sha256; do sha256sum -c "$s"; done )
+          else
+            echo "::warning title=No corpus digest::nothing to verify against"
+          fi
           zstd -dc /tmp/dl/cryptex-sys-macho.tar.zst | tar -x -C /tmp/cryptex/sys
           if [ -s /tmp/dl/cryptex-app-macho.tar.zst ]; then
             zstd -dc /tmp/dl/cryptex-app-macho.tar.zst | tar -x -C /tmp/cryptex/app
