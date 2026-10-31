@@ -480,3 +480,132 @@ alle1 alle1is alle2 alle2is alle3 alle3is vae2 vae2is vale2 vale2is
 vae3 vae3is vale3 vale3is ipas2e1 ipas2e1is ipas2le1 ipas2le1is
 vmalls12e1 vmalls12e1is
 """.split())
+
+# ---------------------------------------------------------------------------
+# Field-indexed tables for the op0 = 0b00 and op0 = 0b01 halves of the
+# system-instruction class.
+#
+# Why these exist: SUPRA_SYS_OPS / BASELINE_SYS_OPS above are keyed by the
+# *operand name* a disassembler prints (`dc civac`, `tlbi vae1is`). A
+# disassembler that does not know an alias prints the raw `sys #op1, Cn, Cm,
+# #op2` form instead, and then an operand-name lookup cannot fire at all.
+# Classification therefore needs a second, field-indexed path.
+#
+# Both tables below were derived from the local LLVM (clang 19.1.7 llvm-mc,
+# -mattr=+all) by tools/testdata/gen_sys_field_tables.py, which enumerates the
+# whole subspace and records what the reference decoder makes of each word:
+#   * op0 = 0b01: 32,768 encodings probed, 229 are named operations, and every
+#     named one lies in CRn 7, 8 or 9. CRn 11 and 15 - the IMP-DEF
+#     system-instruction space - hold no architectural operation at all.
+#   * op0 = 0b00: only CRn 1, 2, 3 and 4 hold named encodings; of the 64
+#     (op1, op2) MSR-immediate slots at CRn = 4, exactly 10 are allocated.
+# ---------------------------------------------------------------------------
+
+SYS_NAMED_ENC_RAW = """
+0:0:7:1:0=ialluis 0:0:7:5:0=iallu 0:0:7:6:1=ivac 0:0:7:6:2=isw 0:0:7:6:3=igvac 0:0:7:6:4=igsw
+0:0:7:6:5=igdvac 0:0:7:6:6=igdsw 0:0:7:8:0=s1e1r 0:0:7:8:1=s1e1w 0:0:7:8:2=s1e0r 0:0:7:8:3=s1e0w
+0:0:7:9:0=s1e1rp 0:0:7:9:1=s1e1wp 0:0:7:9:2=s1e1a 0:0:7:10:2=csw 0:0:7:10:4=cgsw 0:0:7:10:6=cgdsw
+0:0:7:14:2=cisw 0:0:7:14:4=cigsw 0:0:7:14:6=cigdsw 0:0:8:1:0=vmalle1os 0:0:8:1:1=vae1os 0:0:8:1:2=aside1os
+0:0:8:1:3=vaae1os 0:0:8:1:5=vale1os 0:0:8:1:7=vaale1os 0:0:8:2:1=rvae1is 0:0:8:2:3=rvaae1is 0:0:8:2:5=rvale1is
+0:0:8:2:7=rvaale1is 0:0:8:3:0=vmalle1is 0:0:8:3:1=vae1is 0:0:8:3:2=aside1is 0:0:8:3:3=vaae1is 0:0:8:3:5=vale1is
+0:0:8:3:7=vaale1is 0:0:8:5:1=rvae1os 0:0:8:5:3=rvaae1os 0:0:8:5:5=rvale1os 0:0:8:5:7=rvaale1os 0:0:8:6:1=rvae1
+0:0:8:6:3=rvaae1 0:0:8:6:5=rvale1 0:0:8:6:7=rvaale1 0:0:8:7:0=vmalle1 0:0:8:7:1=vae1 0:0:8:7:2=aside1
+0:0:8:7:3=vaae1 0:0:8:7:5=vale1 0:0:8:7:7=vaale1 0:0:9:1:0=vmalle1osnxs 0:0:9:1:1=vae1osnxs 0:0:9:1:2=aside1osnxs
+0:0:9:1:3=vaae1osnxs 0:0:9:1:5=vale1osnxs 0:0:9:1:7=vaale1osnxs 0:0:9:2:1=rvae1isnxs 0:0:9:2:3=rvaae1isnxs 0:0:9:2:5=rvale1isnxs
+0:0:9:2:7=rvaale1isnxs 0:0:9:3:0=vmalle1isnxs 0:0:9:3:1=vae1isnxs 0:0:9:3:2=aside1isnxs 0:0:9:3:3=vaae1isnxs 0:0:9:3:5=vale1isnxs
+0:0:9:3:7=vaale1isnxs 0:0:9:5:1=rvae1osnxs 0:0:9:5:3=rvaae1osnxs 0:0:9:5:5=rvale1osnxs 0:0:9:5:7=rvaale1osnxs 0:0:9:6:1=rvae1nxs
+0:0:9:6:3=rvaae1nxs 0:0:9:6:5=rvale1nxs 0:0:9:6:7=rvaale1nxs 0:0:9:7:0=vmalle1nxs 0:0:9:7:1=vae1nxs 0:0:9:7:2=aside1nxs
+0:0:9:7:3=vaae1nxs 0:0:9:7:5=vale1nxs 0:0:9:7:7=vaale1nxs 0:3:7:2:7=trcit 0:3:7:3:4=cfp 0:3:7:3:5=dvp
+0:3:7:3:6=cosp 0:3:7:3:7=cpp 0:3:7:4:1=zva 0:3:7:4:3=gva 0:3:7:4:4=gzva 0:3:7:5:1=ivau
+0:3:7:7:0=gcspushm 0:3:7:7:2=gcsss1 0:3:7:10:1=cvac 0:3:7:10:3=cgvac 0:3:7:10:5=cgdvac 0:3:7:11:1=cvau
+0:3:7:12:1=cvap 0:3:7:12:3=cgvap 0:3:7:12:5=cgdvap 0:3:7:13:1=cvadp 0:3:7:13:3=cgvadp 0:3:7:13:5=cgdvadp
+0:3:7:14:1=civac 0:3:7:14:3=cigvac 0:3:7:14:5=cigdvac 0:4:7:8:0=s1e2r 0:4:7:8:1=s1e2w 0:4:7:8:4=s12e1r
+0:4:7:8:5=s12e1w 0:4:7:8:6=s12e0r 0:4:7:8:7=s12e0w 0:4:7:9:2=s1e2a 0:4:7:14:0=cipae 0:4:7:14:7=cigdpae
+0:4:8:0:1=ipas2e1is 0:4:8:0:2=ripas2e1is 0:4:8:0:5=ipas2le1is 0:4:8:0:6=ripas2le1is 0:4:8:1:0=alle2os 0:4:8:1:1=vae2os
+0:4:8:1:4=alle1os 0:4:8:1:5=vale2os 0:4:8:1:6=vmalls12e1os 0:4:8:2:1=rvae2is 0:4:8:2:2=vmallws2e1is 0:4:8:2:5=rvale2is
+0:4:8:3:0=alle2is 0:4:8:3:1=vae2is 0:4:8:3:4=alle1is 0:4:8:3:5=vale2is 0:4:8:3:6=vmalls12e1is 0:4:8:4:0=ipas2e1os
+0:4:8:4:1=ipas2e1 0:4:8:4:2=ripas2e1 0:4:8:4:3=ripas2e1os 0:4:8:4:4=ipas2le1os 0:4:8:4:5=ipas2le1 0:4:8:4:6=ripas2le1
+0:4:8:4:7=ripas2le1os 0:4:8:5:1=rvae2os 0:4:8:5:2=vmallws2e1os 0:4:8:5:5=rvale2os 0:4:8:6:1=rvae2 0:4:8:6:2=vmallws2e1
+0:4:8:6:5=rvale2 0:4:8:7:0=alle2 0:4:8:7:1=vae2 0:4:8:7:4=alle1 0:4:8:7:5=vale2 0:4:8:7:6=vmalls12e1
+0:4:9:0:1=ipas2e1isnxs 0:4:9:0:2=ripas2e1isnxs 0:4:9:0:5=ipas2le1isnxs 0:4:9:0:6=ripas2le1isnxs 0:4:9:1:0=alle2osnxs 0:4:9:1:1=vae2osnxs
+0:4:9:1:4=alle1osnxs 0:4:9:1:5=vale2osnxs 0:4:9:1:6=vmalls12e1osnxs 0:4:9:2:1=rvae2isnxs 0:4:9:2:2=vmallws2e1isnxs 0:4:9:2:5=rvale2isnxs
+0:4:9:3:0=alle2isnxs 0:4:9:3:1=vae2isnxs 0:4:9:3:4=alle1isnxs 0:4:9:3:5=vale2isnxs 0:4:9:3:6=vmalls12e1isnxs 0:4:9:4:0=ipas2e1osnxs
+0:4:9:4:1=ipas2e1nxs 0:4:9:4:2=ripas2e1nxs 0:4:9:4:3=ripas2e1osnxs 0:4:9:4:4=ipas2le1osnxs 0:4:9:4:5=ipas2le1nxs 0:4:9:4:6=ripas2le1nxs
+0:4:9:4:7=ripas2le1osnxs 0:4:9:5:1=rvae2osnxs 0:4:9:5:2=vmallws2e1osnxs 0:4:9:5:5=rvale2osnxs 0:4:9:6:1=rvae2nxs 0:4:9:6:2=vmallws2e1nxs
+0:4:9:6:5=rvale2nxs 0:4:9:7:0=alle2nxs 0:4:9:7:1=vae2nxs 0:4:9:7:4=alle1nxs 0:4:9:7:5=vale2nxs 0:4:9:7:6=vmalls12e1nxs
+0:6:7:8:0=s1e3r 0:6:7:8:1=s1e3w 0:6:7:9:2=s1e3a 0:6:8:1:0=alle3os 0:6:8:1:1=vae3os 0:6:8:1:4=paallos
+0:6:8:1:5=vale3os 0:6:8:2:1=rvae3is 0:6:8:2:5=rvale3is 0:6:8:3:0=alle3is 0:6:8:3:1=vae3is 0:6:8:3:5=vale3is
+0:6:8:4:3=rpaos 0:6:8:4:7=rpalos 0:6:8:5:1=rvae3os 0:6:8:5:5=rvale3os 0:6:8:6:1=rvae3 0:6:8:6:5=rvale3
+0:6:8:7:0=alle3 0:6:8:7:1=vae3 0:6:8:7:4=paall 0:6:8:7:5=vale3 0:6:9:1:0=alle3osnxs 0:6:9:1:1=vae3osnxs
+0:6:9:1:4=paallosnxs 0:6:9:1:5=vale3osnxs 0:6:9:2:1=rvae3isnxs 0:6:9:2:5=rvale3isnxs 0:6:9:3:0=alle3isnxs 0:6:9:3:1=vae3isnxs
+0:6:9:3:5=vale3isnxs 0:6:9:4:3=rpaosnxs 0:6:9:4:7=rpalosnxs 0:6:9:5:1=rvae3osnxs 0:6:9:5:5=rvale3osnxs 0:6:9:6:1=rvae3nxs
+0:6:9:6:5=rvale3nxs 0:6:9:7:0=alle3nxs 0:6:9:7:1=vae3nxs 0:6:9:7:4=paallnxs 0:6:9:7:5=vale3nxs 1:3:7:7:1=gcspopm
+1:3:7:7:3=gcsss2
+"""
+
+SYS_NAMED_ENC = {}
+for _tok in SYS_NAMED_ENC_RAW.split():
+    _k, _v = _tok.split("=")
+    SYS_NAMED_ENC[tuple(int(x) for x in _k.split(":"))] = _v
+del _tok, _k, _v
+
+# CRn values for which op0 = 0b00 holds any architecturally named encoding.
+# Everything else in that half is UNALLOCATED (llvm-mc, -mattr=+all).
+OP0_0_ALLOCATED_CRN = frozenset({1, 2, 3, 4})
+
+# MSR (immediate): (op1, op2) -> (field, category or None if baseline, feature)
+# CRm carries the immediate, except for the SME SVCR slot where CRm selects
+# SM / ZA / SMZA, so the key deliberately ignores CRm.
+PSTATE_FIELDS = {
+    (0, 3): ("UAO", None, "FEAT_UAO(mandatory from Armv8.2)"),
+    (0, 4): ("PAN", None, "FEAT_PAN(mandatory from Armv8.1)"),
+    (0, 5): ("SPSel", None, None),
+    (1, 0): ("ALLINT/PM", CAT_ARCH_EXT, "FEAT_NMI(v8.8)/FEAT_EBEP(v9.3)"),
+    (3, 1): ("SSBS", CAT_ARCH_EXT, "FEAT_SSBS"),
+    (3, 2): ("DIT", CAT_ARCH_EXT, "FEAT_DIT(v8.4)"),
+    (3, 3): ("SVCR.SM/ZA", CAT_SME_SVCR, "FEAT_SME(smstart/smstop)"),
+    (3, 4): ("TCO", CAT_MTE, "FEAT_MTE"),
+    (3, 6): ("DAIFSet", None, None),
+    (3, 7): ("DAIFClr", None, None),
+}
+
+
+def sys_op_era(op):
+    """Era of a named SYS/SYSL operation that the curated tables above do not
+    list, by extension *family*. Returns (category, feature) or None.
+
+    These are family rules, not per-operation citations: every family below
+    was introduced after Armv8.2, so the only judgement they carry - "above
+    the armmac-generic-v1 baseline" - follows from the family alone. The
+    feature string is marked `by family` so a reader does not mistake it for
+    a per-encoding verification.
+    """
+    if op.endswith("nxs"):
+        return CAT_ARCH_EXT, "FEAT_XS(v8.7) by family"
+    if op in ("s1e1a", "s1e2a", "s1e3a"):
+        return CAT_ARCH_EXT, "FEAT_ATS1A(v8.9) by family"
+    if op in ("s1e1rp", "s1e1wp"):
+        return CAT_ARCH_EXT, "FEAT_PAN2(v8.2 optional) by family"
+    if op in ("cfp", "dvp", "cpp"):
+        return CAT_ARCH_EXT, "FEAT_SPECRES(v8.5) by family"
+    if op == "cosp":
+        return CAT_ARCH_EXT, "FEAT_SPECRES2(v8.9) by family"
+    if op == "trcit":
+        return CAT_ARCH_EXT, "FEAT_ITE(v9.4) by family"
+    if op.startswith("gcs"):
+        return CAT_ARCH_EXT, "FEAT_GCS(v9.4) by family"
+    if op in ("cgvap", "cgdvap"):
+        return CAT_MTE, "FEAT_MTE+FEAT_DPB(v8.2) by family"
+    if op in ("cgvadp", "cgdvadp"):
+        return CAT_MTE, "FEAT_MTE+FEAT_DPB2(v8.5) by family"
+    if op in ("igdsw",):
+        return CAT_MTE, "FEAT_MTE by family"
+    if op in ("cipae", "cigdpae") or op.startswith("paall") \
+            or op.startswith("rpa") or op.startswith("vmallws2e1"):
+        return CAT_ARCH_EXT, "FEAT_RME(v9.2) by family"
+    if op.startswith("ripas") or (op.startswith("r") and (
+            "vae" in op or "vaae" in op or "vale" in op or "vaale" in op)):
+        return CAT_ARCH_EXT, "FEAT_TLBIRANGE(v8.4) by family"
+    if op.endswith("os"):
+        return CAT_ARCH_EXT, "FEAT_TLBIOS(v8.4) by family"
+    return None

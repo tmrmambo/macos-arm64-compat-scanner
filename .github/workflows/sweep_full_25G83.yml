@@ -130,6 +130,35 @@ name: Full 25G83 vma2 image ARMv8.2-A sweep (A11)
 #     (run 41045152598)
 #   * every degraded branch appends to reports/missing_components.txt and the
 #     final step turns the run red on it, whatever else passed
+#
+# -----------------------------------------------------------------------------
+# PREREQUISITE THAT WAS BLOCKING THIS WORKFLOW (register-audit.md U1)
+# -----------------------------------------------------------------------------
+# The first attempt at a sharded userland sweep died with MemoryError inside
+# sweep_kernelcache.Sweep.sweep_segment: the pass-B decode loop was handed
+# `buf[pos:]`, a fresh copy of the whole remaining segment, on EVERY restart
+# at an undecodable word. That is now a bounded 256 KiB window
+# (sweep_kernelcache.DECODE_WINDOW).
+#
+# The fix touches the hot loop every coverage number depends on, so it was
+# gated rather than trusted:
+#
+#   * tools/testdata/bench_memoryview_fix.py decodes BootKC's largest segment
+#     with six slicing strategies and fails unless all six produce the same
+#     sha256 instruction stream. They do (2,432,311 insn, 1,113 undecodable).
+#     Peak transient allocation drops from 9.71 MB to 0.26 MB, and the
+#     window form measured 1.37x the shipped loop's throughput.
+#   * The full BootKC sweep was re-run and compared leaf by leaf with
+#     tools/testdata/compare_sweep_outputs.py: 574 leaves of
+#     byte-coverage.json and 728 of summary.json, ZERO non-volatile
+#     differences; coverage-manifest.jsonl 692,345 lines both times;
+#     components.csv byte-identical. Only scan_seconds moved, 680.3 -> 396.9.
+#
+# Note for anyone revisiting this: the one-line change U1 proposed (pass
+# `memoryview(buf)[pos:]`) does NOT work with capstone 5.0.x. Its binding
+# calls view.tobytes() on a read-only view, so the full tail copy is still
+# made and the measured result is 0.82x the shipped speed with an unchanged
+# 9.74 MB transient. The window is what fixes it.
 # =============================================================================
 
 on:
@@ -160,9 +189,9 @@ on:
         required: true
         default: '66b86bd525e8cb90f9012543be89b1f092b75cf3'
       capstone_version:
-        description: 'Pinned capstone. Findings depend on the decoder, so this must match the version the local baseline was produced with (5.0.1).'
+        description: 'Pinned capstone. Findings depend on the decoder, so this must match the version the local control numbers were produced with (5.0.7 -> core 5.0.1280). 5.0.1 is NOT that version.'
         required: true
-        default: '5.0.1'
+        default: '5.0.7'
       dsc_shards:
         description: 'Matrix width for the dyld shared cache. 8 x 4 processes = 32 workers over 3.71 GB of executable mapping.'
         required: true
@@ -270,10 +299,26 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends zstd jq curl python3-pip
           # Findings are a function of the decoder, so capstone is pinned to the
-          # version the local 81,453-finding control was measured with.
+          # version the local 81,453-finding control was measured with. That
+          # version is the PyPI package 5.0.7, whose core reports (5, 0, 1280).
+          # The default used to say 5.0.1, which is a different decoder: the
+          # local host has never had it installed, so no local number was ever
+          # produced with it and a cloud run on 5.0.1 would not be comparable
+          # to the BootKC baseline. register-audit.md D4 is the concrete
+          # reason this matters -- the SYS alias gap it quantified (1 of 95
+          # operations) is a property of a specific capstone build.
           pip3 install --break-system-packages "capstone==${CAPSTONE_VERSION}" \
             || pip3 install "capstone==${CAPSTONE_VERSION}"
-          python3 -c "import capstone; print('capstone core', capstone.cs_version())"
+          python3 -c "import capstone; print('capstone pkg', capstone.__version__, 'core', capstone.cs_version())"
+          # Decoder-drift gate: the CORE triple, not the package version
+          # string, is what determines the findings. The BootKC control was
+          # produced with core (5, 0, 1280). Mismatch warns loudly and is
+          # recorded, because a drifted decoder makes the cloud numbers
+          # incomparable to the local baseline rather than merely different.
+          python3 -c "import capstone; g=tuple(capstone.cs_version()); w=(5,0,1280); print('capstone core',g,'control',w); print('::warning title=Decoder drift::capstone core %s != %s; findings are decoder-dependent and may not be comparable to the BootKC baseline.'%(g,w)) if g!=w else print('decoder matches the control')" \
+            | tee "$REPORTS/capstone_version.txt"
+          grep -q 'Decoder drift' "$REPORTS/capstone_version.txt" \
+            && echo "CAPSTONE_DECODER_DRIFT $(python3 -c 'import capstone;print(capstone.cs_version())')" >> "$MISSING_FILE" || true
           python3 -VV
           mkdir -p "$REPORTS" "$WORK" out
           : > "$MISSING_FILE"

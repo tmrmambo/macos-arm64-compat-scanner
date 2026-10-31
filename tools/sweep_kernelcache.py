@@ -121,6 +121,14 @@ NEAR_DATA_STATES = {ST_DATA_REFERENCED_BLOB, ST_DATA_LITERAL_POOL,
                     ST_DATA_NONCODE_SECTION, ST_DATA_SEGMENT_GAP,
                     ST_DATA_INLINE_STRING, ST_DATA_OR_TRAP_UDF,
                     ST_DATA_PADDING_ZERO, ST_DATA_UNREACHABLE_UNDECODABLE}
+
+# Largest slice handed to capstone in one pass-B call. Caps the decode loop's
+# transient allocation at this size instead of letting it scale with the
+# segment, which is what made a dyld-cache range exhaust memory
+# (register-audit.md U1; see sweep_segment for the full note). MUST stay a
+# multiple of 4 so no A64 instruction straddles a window edge.
+DECODE_WINDOW = 1 << 18          # 256 KiB = 65,536 words
+assert DECODE_WINDOW % 4 == 0
 # States resolved only by weak (negative) evidence; reported separately.
 WEAK_STATES = {ST_DATA_UNREACHABLE_UNDECODABLE}
 
@@ -303,6 +311,32 @@ def sysreg_fields(w):
     return (
         bool((w >> 21) & 1),
         2 + ((w >> 19) & 1),
+        (w >> 16) & 7,
+        (w >> 12) & 0xF,
+        (w >> 8) & 0xF,
+        (w >> 5) & 7,
+        w & 0x1F,
+    )
+
+
+def sysinstr_fields(w):
+    """Any word of the system-instruction class 0xD5000000-0xD53FFFFF.
+
+    -> (is_read, op0, op1, crn, crm, op2, rt) with op0 in 0..3, or None.
+
+    sysreg_fields() above only admits op0 in {2,3}, the MRS/MSR register
+    forms. The other two quarters of this class carry real state accesses as
+    well - op0=0b00 is PSTATE (MSR immediate) plus the hint and barrier space,
+    op0=0b01 is SYS/SYSL, which includes the IMPLEMENTATION DEFINED
+    system-instruction space at CRn 11 and 15 - so they need their own
+    field-indexed classification rather than being judged by whatever
+    mnemonic text a disassembler prints.
+    """
+    if (w >> 22) != 0x354:
+        return None
+    return (
+        bool((w >> 21) & 1),
+        (w >> 19) & 3,
         (w >> 16) & 7,
         (w >> 12) & 0xF,
         (w >> 8) & 0xF,
@@ -589,6 +623,11 @@ class Classifier:
         self.mnem_verdict = collections.Counter()
         self.sysreg_census = collections.Counter()
         self.sysreg_verdict = {}
+        # op0 in {0,1}: SYS / SYSL and MSR-immediate (PSTATE). Kept in its own
+        # census so that sysreg-census.json keeps meaning exactly what it
+        # meant before (MRS/MSR register forms only).
+        self.sysinstr_census = collections.Counter()
+        self.sysinstr_verdict = {}
 
     def classify_mnemonic(self, mnem, ops):
         """-> None if baseline, else (category, detail, feature, severity)."""
@@ -656,10 +695,21 @@ class Classifier:
             return (B.CAT_IMPDEF_SYSREG, f"{mnem} {ops}".strip(),
                     f"{enc} CRn={crn} IMPDEF", "block", enc, key)
         if name is None:
+            # Unnamed and outside CRn 11/15, so it is NOT in the IMP-DEF
+            # register space: it is an unallocated encoding of the
+            # architectural space. Calling that "IMPDEF" asserts a vendor
+            # meaning the encoding does not carry (and for op0=2 the IMP-DEF
+            # sub-space rule is itself unverified - see the baseline's
+            # unverified-items list). Report it, but as needing review.
             self.sysreg_verdict[key] = (
-                f"{B.CAT_IMPDEF_SYSREG}:no ARM-architectural name for encoding")
-            return (B.CAT_IMPDEF_SYSREG, f"{mnem} {ops}".strip(),
-                    f"{enc} unnamed/unallocated", "block", enc, key)
+                f"{B.CAT_UNCLASSIFIED_SYSREG}:unallocated in the architectural "
+                f"register space (op0={op0}, CRn={crn} is not an IMP-DEF CRn)")
+            return (B.CAT_UNCLASSIFIED_SYSREG, f"{mnem} {ops}".strip(),
+                    f"{enc} unallocated: no architectural name and CRn={crn} is "
+                    f"outside the IMP-DEF space (CRn 11/15); "
+                    f"{'debug/trace' if op0 == 2 else 'non-debug'} half, "
+                    "IMP-DEF sub-space rule unverified",
+                    "block", enc, key)
         if name in B.SUPRA_SYSREGS:
             cat, feat = B.SUPRA_SYSREGS[name]
             self.sysreg_verdict[key] = f"{cat}:{feat}"
@@ -672,6 +722,112 @@ class Classifier:
         return (B.CAT_UNCLASSIFIED_SYSREG, f"{mnem} {ops}".strip(),
                 f"{enc} name={name} not in baseline or above-baseline table",
                 "block", enc, key)
+
+
+    # -- op0 = 0b01: SYS / SYSL -------------------------------------------
+    def classify_sys_instruction(self, w, mnem, ops):
+        """Field-indexed classification of the SYS / SYSL space.
+
+        -> None if baseline, else (category, disasm, detail, severity).
+
+        The operation identity is (L, op1, CRn, CRm, op2); Rt is an operand.
+        B.SYS_NAMED_ENC holds every encoding the reference decoder names
+        (229 of 32,768, all in CRn 7/8/9), so anything outside it is
+        unallocated and anything unallocated inside CRn 11/15 is the IMP-DEF
+        system-instruction space.
+        """
+        L, op0, op1, crn, crm, op2, _rt = sysinstr_fields(w)
+        form = f"{'sysl' if L else 'sys'} #{op1}, c{crn}, c{crm}, #{op2}"
+        op = B.SYS_NAMED_ENC.get((int(L), op1, crn, crm, op2))
+        key = op or form
+        self.sysinstr_census[(form, key)] += 1
+        text = f"{mnem} {ops}".strip()
+
+        if op is not None:
+            if op in B.SUPRA_SYS_OPS:
+                cat, feat = B.SUPRA_SYS_OPS[op]
+                self.sysinstr_verdict[key] = f"{cat}:{feat}"
+                return cat, text, f"{feat} ({form} = {op})", "block"
+            if op in B.BASELINE_SYS_OPS:
+                self.sysinstr_verdict.setdefault(key, "BASELINE")
+                return None
+            era = B.sys_op_era(op)
+            if era is not None:
+                cat, feat = era
+                self.sysinstr_verdict[key] = f"{cat}:{feat}"
+                return cat, text, f"{feat} ({form} = {op})", "block"
+            self.sysinstr_verdict[key] = B.CAT_UNCLASSIFIED_SYSREG
+            return (B.CAT_UNCLASSIFIED_SYSREG, text,
+                    f"{form} = {op}: architectural SYS operation that is in "
+                    "neither the baseline nor the above-baseline era table",
+                    "block")
+
+        if crn in (11, 15):
+            self.sysinstr_verdict[key] = (
+                f"{B.CAT_IMPDEF_SYSREG}:op0=0b01 CRn={crn} IMP-DEF "
+                "system-instruction space")
+            return (B.CAT_IMPDEF_SYSREG, text,
+                    f"{form}: op0=0b01 with CRn={crn} is the IMPLEMENTATION "
+                    "DEFINED system-instruction space; no architectural "
+                    "operation is allocated here (confidence: medium, see "
+                    "baseline rule 2)", "block")
+        self.sysinstr_verdict[key] = (
+            f"{B.CAT_UNCLASSIFIED_SYSREG}:unallocated SYS/SYSL encoding")
+        return (B.CAT_UNCLASSIFIED_SYSREG, text,
+                f"{form}: unallocated SYS/SYSL encoding - no architectural "
+                f"operation and CRn={crn} is outside the IMP-DEF space "
+                "(CRn 11/15); UNDEFINED on a baseline PE", "block")
+
+    # -- op0 = 0b00: MSR immediate (PSTATE), hints, barriers ---------------
+    def classify_pstate(self, w, mnem, ops):
+        """-> None if baseline, 'MNEMONIC' to defer to mnemonic classification,
+        else (category, disasm, detail, severity)."""
+        _L, _op0, op1, crn, crm, op2, _rt = sysinstr_fields(w)
+        text = f"{mnem} {ops}".strip()
+        if crn == 4:
+            form = f"msr-imm op1={op1} CRm={crm} op2={op2}"
+            ent = B.PSTATE_FIELDS.get((op1, op2))
+            key = ent[0] if ent else f"msr-imm op1={op1} op2={op2}"
+            self.sysinstr_census[(form, key)] += 1
+            if ent is None:
+                self.sysinstr_verdict[key] = (
+                    f"{B.CAT_UNCLASSIFIED_SYSREG}:unallocated PSTATE field")
+                return (B.CAT_UNCLASSIFIED_SYSREG, text,
+                        f"{form}: unallocated PSTATE field - the architecture "
+                        "allocates 10 of the 64 (op1, op2) slots and this is "
+                        "not one of them; UNDEFINED on a baseline PE", "block")
+            field, cat, feat = ent
+            if cat is None:
+                self.sysinstr_verdict.setdefault(key, "BASELINE")
+                return None
+            self.sysinstr_verdict[key] = f"{cat}:{feat}"
+            return cat, text, f"{feat}: PSTATE.{field} via {form}", "block"
+        if crn not in B.OP0_0_ALLOCATED_CRN:
+            form = f"op0=0 op1={op1} CRn={crn} CRm={crm} op2={op2}"
+            self.sysinstr_census[(form, "<unallocated op0=0 CRn>")] += 1
+            self.sysinstr_verdict["<unallocated op0=0 CRn>"] = (
+                f"{B.CAT_UNCLASSIFIED_SYSREG}:unallocated op0=0b00 CRn")
+            return (B.CAT_UNCLASSIFIED_SYSREG, text,
+                    f"{form}: op0=0b00 holds named encodings only at "
+                    "CRn 1/2/3/4; this CRn is UNALLOCATED", "block")
+        # CRn 1/2/3: hint, barrier and CLREX space. These decode to real
+        # mnemonics (nop / isb / dsb / hint #N / bti / pacia1716 ...) and the
+        # mnemonic tables already carry the era judgement for each. But if the
+        # decoder fell back to the raw `sys`/`msr S0_...` form it recognised
+        # nothing, and deferring to the mnemonic tables would accept the word
+        # as baseline on the strength of the word `sys` alone.
+        if mnem in ("sys", "sysl") or NUMERIC_SYSREG_RE.match(
+                ops.split(",")[0].strip().lower()):
+            form = f"op0=0 op1={op1} CRn={crn} CRm={crm} op2={op2}"
+            key = "<unaliased op0=0 CRn 1/2/3>"
+            self.sysinstr_census[(form, key)] += 1
+            self.sysinstr_verdict[key] = (
+                f"{B.CAT_UNCLASSIFIED_SYSREG}:decoder produced no alias")
+            return (B.CAT_UNCLASSIFIED_SYSREG, text,
+                    f"{form}: inside the op0=0b00 hint/barrier/CLREX space but "
+                    "the decoder produced no alias, so no era judgement is "
+                    "available for it", "block")
+        return "MNEMONIC"
 
 
 SYS_OP_RE = re.compile(r"^(dc|ic|at|tlbi)$")
@@ -849,9 +1005,39 @@ class Sweep:
         pending = {}
         pos = 0
         n = nwords * 4
+        # The decoder is restarted at every word capstone cannot decode. It
+        # used to be handed `buf[pos:]`, i.e. a fresh copy of the WHOLE
+        # remaining tail, so a segment with N undecodable words copied its
+        # tail N times and held a second full-size block live across the FFI
+        # call. On BootKC's largest segment that is 1,113 slices / 10.84 GB
+        # memcpy'd and a 9.7 MB transient; on a dyld-cache range with no
+        # image table entries the "segment" is a whole executable mapping,
+        # and six parallel workers each holding 3x a multi-hundred-MB block
+        # is what raised MemoryError (register-audit.md U1).
+        #
+        # Slicing to a bounded window caps the transient at DECODE_WINDOW
+        # regardless of segment size. Every A64 instruction is 4 bytes and
+        # DECODE_WINDOW is 4-aligned, so no instruction can straddle a window
+        # edge; `adrp_page` is deliberately NOT cleared at a window edge, so
+        # an adrp/add pair split across one still resolves. Equivalence is
+        # not assumed: tools/testdata/bench_memoryview_fix.py decodes this
+        # segment with six slicing strategies and fails unless all six
+        # produce the same sha256 instruction stream.
+        #
+        # NOTE on the one-line fix U1 actually proposed (pass
+        # `memoryview(buf)[pos:]`): with capstone 5.0.7 that is NOT zero
+        # copy and does NOT fix the OOM. The binding does
+        #     view = memoryview(code)
+        #     if not view.readonly: ...from_buffer...   # zero copy
+        #     elif not isinstance(code, bytes): code = view.tobytes()
+        # and a view over immutable bytes is read-only and not a `bytes`, so
+        # it takes the tobytes() branch: same full tail copy, plus overhead.
+        # Measured: 0.82x the speed of the shipped loop, identical 9.74 MB
+        # transient. See analysis/compat/oomfix-bench.json.
         while pos < n:
+            end = n if n - pos <= DECODE_WINDOW else pos + DECODE_WINDOW
             consumed = 0
-            for (addr, size, mnem, ops) in cs.disasm_lite(buf[pos:], base_va + pos):
+            for (addr, size, mnem, ops) in cs.disasm_lite(buf[pos:end], base_va + pos):
                 widx = (addr - base_va) >> 2
                 consumed += size
                 if state[widx] == ST_DATA_NONCODE_SECTION:
@@ -896,18 +1082,31 @@ class Sweep:
                             adrp_page.pop(rd, None)
 
                 verdict = None
-                if mnem in ("mrs", "msr"):
+                # The whole system-instruction class is dispatched on the
+                # decoded op0 field, not on the mnemonic text: `sys`, `sysl`
+                # and `msr` are baseline mnemonics, so a mnemonic-first
+                # dispatch accepts every encoding a decoder cannot alias.
+                si = sysinstr_fields(w)
+                if si is not None and si[1] >= 2:
                     sr = self.cls.classify_sysreg(w, mnem, ops)
                     if sr is not None:
                         verdict = sr[:4]
-                    elif sysreg_fields(w) is None:
+                elif si is not None and si[1] == 1:
+                    verdict = self.cls.classify_sys_instruction(w, mnem, ops)
+                    if verdict is not None and not SYS_OP_RE.match(mnem) \
+                            and mnem not in ("sys", "sysl"):
+                        # a decoder-specific alias we did not anticipate
+                        verdict = (verdict[0], verdict[1],
+                                   verdict[2] + f"; decoder printed '{mnem}'",
+                                   verdict[3])
+                elif si is not None and si[1] == 0:
+                    verdict = self.cls.classify_pstate(w, mnem, ops)
+                    if verdict == "MNEMONIC":
                         verdict = self.cls.classify_mnemonic(mnem, ops)
                 elif mnem in ("hvc", "smc"):
                     imm = (w >> 5) & 0xFFFF
                     verdict = (B.CAT_HVC_SMC, f"{mnem} {ops}".strip(),
                                f"imm16={imm:#x}", "block")
-                elif SYS_OP_RE.match(mnem):
-                    verdict = classify_sys_alias(mnem, ops)
                 else:
                     verdict = self.cls.classify_mnemonic(mnem, ops)
                 if verdict is None:
@@ -915,8 +1114,16 @@ class Sweep:
                 else:
                     state[widx] = ST_CODE_SUPRA
                     pending[widx] = verdict
-            pos += consumed
-            if pos < n:
+            if consumed:
+                pos += consumed
+                if pos < end:
+                    # capstone stopped short of the window: the word at the
+                    # new `pos` is undecodable. A full window means we simply
+                    # advance to the next one, and `adrp_page` must survive
+                    # that edge so an adrp/add pair split across it resolves.
+                    pos += 4
+                    adrp_page.clear()
+            else:
                 pos += 4          # capstone could not decode the word at pos
                 adrp_page.clear()
 
@@ -1473,6 +1680,19 @@ def main():
                for (enc, key), n in sweep.cls.sysreg_census.most_common()]
     with open(os.path.join(args.outdir, "sysreg-census.json"), "w", encoding="utf-8") as f:
         json.dump({"count": len(sysregs), "sysregs": sysregs}, f, indent=1)
+    sysinstrs = [{"form": form, "operation": key, "n": n,
+                  "verdict": sweep.cls.sysinstr_verdict.get(key, "BASELINE")}
+                 for (form, key), n in sweep.cls.sysinstr_census.most_common()]
+    with open(os.path.join(args.outdir, "sysinstr-census.json"), "w",
+              encoding="utf-8") as f:
+        json.dump({"count": len(sysinstrs),
+                   "note": "op0=0b00 (MSR immediate / PSTATE) and op0=0b01 "
+                           "(SYS / SYSL) halves of the system-instruction "
+                           "class, classified from decoded fields. "
+                           "sysreg-census.json covers op0 in {0b10,0b11} "
+                           "(MRS/MSR register forms) and keeps its earlier "
+                           "meaning unchanged.",
+                   "sysinstrs": sysinstrs}, f, indent=1)
 
     # ---- component closure --------------------------------------------
     with open(os.path.join(args.outdir, "components.csv"), "w", encoding="utf-8",
@@ -1542,7 +1762,8 @@ def main():
     print(f"kexts with findings        : {len(sweep.kext_counts)} / {len(entries)}")
     print(f"unique functions to handle : {uniq_funcs}")
     print(f"distinct mnemonics decoded : {len(sweep.cls.mnem_census)}")
-    print(f"distinct sysreg encodings  : {len(sysregs)}")
+    print(f"distinct sysreg encodings  : {len(sysregs)}  (op0=0b1x)")
+    print(f"distinct sys-instr forms   : {len(sysinstrs)}  (op0=0b0x)")
     print(f"\npatch-table crosscheck: {xc['patch_vas_confirmed_by_sweep']}"
           f"/{xc['patch_table_exact_vas']} EXACT_VA_PATCHES confirmed; "
           f"{len(xc['patch_vas_not_seen_by_sweep'])} not seen; "
