@@ -15,6 +15,9 @@ on:
 
 env:
   IPSW_APFS_FUSE_PATH: /usr/local/bin/apfs-fuse
+  # Project version pins (docs/workstreams.md, extract_full_25G83.yml).
+  IPSW_VERSION: '3.1.739'
+  APFS_FUSE_REF: '66b86bd525e8cb90f9012543be89b1f092b75cf3'
 
 jobs:
   package-minimal-rootfs:
@@ -41,23 +44,49 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential cmake git libfuse3-dev zlib1g-dev \
-                                  libbz2-dev libattr1-dev python3-pip curl jq \
+                                  libbz2-dev libattr1-dev libacl1-dev python3-pip curl jq \
                                   qemu-utils zstd dosfstools mtools gdisk
           echo "Cloning and building apfs-fuse from source..."
           git clone --recursive https://github.com/sgan81/apfs-fuse.git /tmp/apfs-fuse
-          cd /tmp/apfs-fuse
-          mkdir build && cd build
-          cmake ..
-          make -j$(nproc)
-          sudo cp apfs-* /usr/local/bin/
-          which apfs-fuse
+          git -C /tmp/apfs-fuse checkout --quiet --recurse-submodules "$APFS_FUSE_REF"
+          echo "apfs-fuse commit: $(git -C /tmp/apfs-fuse rev-parse HEAD)"
+          cmake --version | head -n 1
+          g++ --version | head -n 1
+          # Two pieces of runner toolchain drift. Both are fatal without these
+          # flags and both were diagnosed on extract_full_25G83.yml; the same
+          # two killed this workflow because it builds the same source.
+          #
+          # 1. CMAKE_POLICY_VERSION_MINIMUM: the image moved to CMake 4.x,
+          #    which removed support for the old cmake_minimum_required
+          #    apfs-fuse declares, so configure aborts with "Compatibility
+          #    with CMake < 3.5 has been removed from CMake"
+          #    (run 41037554980). This flag is the escape hatch CMake's own
+          #    error message names.
+          # 2. -include cstdint: the image's g++ (15.2) no longer pulls
+          #    <cstdint> in transitively, and ApfsLib/PList.h uses uint8_t
+          #    without including it, so PList.cpp fails with "uint8_t does
+          #    not name a type" (run 41038815362). Force-including the header
+          #    fixes every C++ translation unit at once with no upstream
+          #    patch. C sources (3rdparty/lzfse) are untouched: C++ only.
+          cmake -S /tmp/apfs-fuse -B /tmp/apfs-fuse/build \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+                -DCMAKE_CXX_FLAGS='-include cstdint'
+          cmake --build /tmp/apfs-fuse/build -j "$(nproc)"
+          # `cp apfs-*` silently dropped apfsutil, which is the only way to
+          # log the container's volume list. Take both.
+          sudo find /tmp/apfs-fuse/build -maxdepth 1 -type f -perm -u+x \
+               \( -name 'apfs-*' -o -name 'apfsutil' \) -exec cp {} /usr/local/bin/ \;
+          command -v apfs-fuse
           apfs-fuse -h || true
 
       - name: Install ipsw CLI
         run: |
-          IPSW_VER=$(curl -s https://api.github.com/repos/blacktop/ipsw/releases/latest | jq -r .tag_name | sed 's/v//')
-          echo "Installing ipsw v${IPSW_VER}..."
-          curl -L -o ipsw.deb "https://github.com/blacktop/ipsw/releases/download/v${IPSW_VER}/ipsw_${IPSW_VER}_linux_x86_64.deb"
+          # Pinned: "latest" floats, and ipsw's CLI surface has already moved
+          # under this repo's workflows once ("ipsw kernel dec -o" takes a
+          # directory, not a file - run 41043160466).
+          echo "Installing ipsw v${IPSW_VERSION}..."
+          curl -fL --retry 3 -o ipsw.deb "https://github.com/blacktop/ipsw/releases/download/v${IPSW_VERSION}/ipsw_${IPSW_VERSION}_linux_x86_64.deb"
           sudo dpkg -i ipsw.deb
           ipsw version
 
