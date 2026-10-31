@@ -296,6 +296,14 @@ jobs:
       - name: Install toolchain
         run: |
           set -euo pipefail
+          # First thing in the step, because several commands below tee into
+          # $REPORTS and `bash -e` turns a missing directory into a dead run
+          # (that is exactly how run 41161891227 died).
+          mkdir -p "$REPORTS" "$WORK" out
+          # Truncate the degradation ledger here too, BEFORE anything can
+          # append to it. It used to be truncated further down, which would
+          # have silently erased a decoder-drift entry written above it.
+          : > "$MISSING_FILE"
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends zstd jq curl python3-pip
           # Findings are a function of the decoder, so capstone is pinned to the
@@ -320,8 +328,6 @@ jobs:
           grep -q 'Decoder drift' "$REPORTS/capstone_version.txt" \
             && echo "CAPSTONE_DECODER_DRIFT $(python3 -c 'import capstone;print(capstone.cs_version())')" >> "$MISSING_FILE" || true
           python3 -VV
-          mkdir -p "$REPORTS" "$WORK" out
-          : > "$MISSING_FILE"
           {
             echo "run      : ${{ github.run_id }} attempt ${{ github.run_attempt }}"
             echo "sha      : ${{ github.sha }}"
