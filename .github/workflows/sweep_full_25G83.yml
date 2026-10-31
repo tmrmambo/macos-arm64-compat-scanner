@@ -838,7 +838,17 @@ jobs:
           set +e
           mkdir -p "$REPORTS" out/merged out/merged-dsc out/merged-rootfs
           : > "$MISSING_FILE"
-          find /tmp/shards -maxdepth 2 -name byte-coverage.json -printf '%h\n' \
+          # No -maxdepth. upload-artifact@v4 strips only the COMMON prefix of
+          # the paths it is given, and each shard upload lists two of them
+          # (out/<tag>/* and reports/<log>), whose common ancestor is the
+          # workspace root. So the artifact keeps `out/dsc-0/...` inside it,
+          # and after download the file sits at
+          #   /tmp/shards/a11-shard-dsc-0/out/dsc-0/byte-coverage.json
+          # which is three levels down, not two. `-maxdepth 2` found nothing
+          # and run 41162126688 reported AGGREGATE_NO_SHARDS with all 20
+          # sweep jobs green. Recursing fully is both correct now and immune
+          # to the next layout change; the tree is a few hundred files.
+          find /tmp/shards -name byte-coverage.json -printf '%h\n' \
             | sort > /tmp/shard_dirs.txt
           echo "shard dirs found: $(wc -l < /tmp/shard_dirs.txt)"
           cat /tmp/shard_dirs.txt
